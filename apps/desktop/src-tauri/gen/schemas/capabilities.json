@@ -1,0 +1,1 @@
+{"main-capability":{"identifier":"main-capability","description":"Allows the main window to access core IPC commands and the system dialog picker.","local":true,"windows":["main"],"permissions":["core:default","dialog:allow-open"]}}
