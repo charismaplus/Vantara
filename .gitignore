@@ -9,5 +9,6 @@ apps/desktop/src-tauri/target/
 packages/contracts/dist/
 devhub_src/node_modules/
 devhub_src/dist/
+devhub_src/shim/tmux.exe
 Workspace Terminal Portable.exe
 Workspace Terminal Portable - 바로 가기.lnk
