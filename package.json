@@ -1,0 +1,20 @@
+{
+  "name": "workspace-terminal",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Project-centric desktop terminal workspace",
+  "workspaces": [
+    "apps/ui",
+    "packages/contracts"
+  ],
+  "scripts": {
+    "dev": "npm run dev --workspace apps/ui",
+    "build": "npm run build --workspace packages/contracts && npm run build --workspace apps/ui",
+    "lint": "npm run lint --workspace apps/ui",
+    "tauri:dev": "npm exec tauri dev -- --config apps/desktop/src-tauri/tauri.conf.json",
+    "tauri:build": "npm exec tauri build -- --config apps/desktop/src-tauri/tauri.conf.json"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.3.1"
+  }
+}

@@ -1,0 +1,13 @@
+node_modules/
+dist/
+build/
+target/
+*.log
+apps/ui/node_modules/
+apps/ui/dist/
+apps/desktop/src-tauri/target/
+packages/contracts/dist/
+devhub_src/node_modules/
+devhub_src/dist/
+Workspace Terminal Portable.exe
+Workspace Terminal Portable - 바로 가기.lnk
