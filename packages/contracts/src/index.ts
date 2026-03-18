@@ -8,7 +8,13 @@ export type Project = {
   createdAt: string;
 };
 
+export type DeleteProjectResult = {
+  deletedProjectId: string;
+  nextProjectId?: string | null;
+};
+
 export type SessionStatus = "starting" | "running" | "exited" | "failed";
+export type LaunchProfile = "terminal" | "claude" | "claudeUnsafe" | "codex" | "codexFullAuto";
 
 export type TerminalSession = {
   id: string;
@@ -16,6 +22,8 @@ export type TerminalSession = {
   title: string;
   program: string;
   args?: string[] | null;
+  launchProfile: LaunchProfile;
+  tmuxShimEnabled: boolean;
   cwd: string;
   status: SessionStatus;
   startedAt?: string | null;
@@ -32,6 +40,7 @@ export type StackItem = {
 
 export type PaneCreatedBy = "user" | "ai";
 export type PaneLaunchState = "unlaunched" | "launched";
+export type SplitZoneKind = "default" | "aiWorkspace";
 
 export type StackNode = {
   id: string;
@@ -49,6 +58,7 @@ export type SplitNode = {
   id: string;
   type: "split";
   direction: "horizontal" | "vertical";
+  zoneKind: SplitZoneKind;
   sizes: number[];
   children: LayoutNode[];
 };
@@ -74,3 +84,24 @@ export type SessionOutputEvent = {
   sessionId: string;
   chunk: string;
 };
+
+export type WorkspaceChangedEvent = {
+  projectId: string;
+};
+
+export type PastePayload =
+  | {
+      kind: "files";
+      paths: string[];
+    }
+  | {
+      kind: "imagePath";
+      imagePath: string;
+    }
+  | {
+      kind: "text";
+      text: string;
+    }
+  | {
+      kind: "empty";
+    };

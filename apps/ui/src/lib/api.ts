@@ -1,7 +1,10 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
+  DeleteProjectResult,
   LayoutNode,
+  LaunchProfile,
   PaneLaunchState,
+  PastePayload,
   Project,
   StackItem,
   TerminalSession,
@@ -13,6 +16,8 @@ import { isTauriRuntime } from "./runtime";
 
 type SplitDirection = "horizontal" | "vertical";
 type PaneOwner = "user" | "ai";
+type SplitZoneKind = "default" | "aiWorkspace";
+type TabViewport = { width: number; height: number };
 
 type CreateSessionArgs = {
   projectId: string;
@@ -22,6 +27,7 @@ type CreateSessionArgs = {
   program?: string;
   args?: string[] | null;
   cwd?: string;
+  launchProfile?: LaunchProfile;
 };
 
 let mockCounter = 0;
@@ -61,6 +67,45 @@ export async function createProject(name: string, path: string) {
 
   const project = await invoke<unknown>("create_project", { name, path });
   return normalizeProject(project);
+}
+
+export async function renameProject(projectId: string, name: string) {
+  const nextName = name.trim();
+  if (!nextName) {
+    throw new Error("Project name is required");
+  }
+
+  if (!isTauriRuntime()) {
+    const project = mockState.projects.find((entry) => entry.id === projectId);
+    if (!project) {
+      throw new Error("Project not found");
+    }
+    project.name = nextName;
+    return { ...project };
+  }
+
+  const project = await invoke<unknown>("rename_project", { projectId, name: nextName });
+  return normalizeProject(project);
+}
+
+export async function deleteProject(projectId: string) {
+  if (!isTauriRuntime()) {
+    const index = mockState.projects.findIndex((entry) => entry.id === projectId);
+    if (index < 0) {
+      throw new Error("Project not found");
+    }
+
+    const nextProjectId = mockState.projects[index + 1]?.id ?? mockState.projects[index - 1]?.id ?? null;
+    mockState.projects.splice(index, 1);
+    mockState.workspaces.delete(projectId);
+    return {
+      deletedProjectId: projectId,
+      nextProjectId,
+    } satisfies DeleteProjectResult;
+  }
+
+  const result = await invoke<unknown>("delete_project", { projectId });
+  return normalizeDeleteProjectResult(result);
 }
 
 export async function openWorkspace(projectId: string) {
@@ -167,6 +212,8 @@ export async function createSession(args: CreateSessionArgs) {
       title: args.title ?? args.program ?? "Terminal",
       program: args.program ?? "powershell",
       args: args.args ?? null,
+      launchProfile: args.launchProfile ?? "terminal",
+      tmuxShimEnabled: (args.launchProfile ?? "terminal") !== "terminal",
       cwd: args.cwd ?? mockState.projects.find((project) => project.id === args.projectId)?.path ?? "D:\\",
       status: "running",
       startedAt: Date.now().toString(),
@@ -180,6 +227,13 @@ export async function createSession(args: CreateSessionArgs) {
     return cloneSnapshot(snapshot);
   }
 
+  console.debug("[launcher] create_session start", {
+    projectId: args.projectId,
+    tabId: args.tabId,
+    stackId: args.stackId,
+    program: args.program,
+    args: args.args,
+  });
   const snapshot = await invoke<unknown>("create_session", {
     projectId: args.projectId,
     tabId: args.tabId,
@@ -188,6 +242,11 @@ export async function createSession(args: CreateSessionArgs) {
     program: args.program,
     args: args.args,
     cwd: args.cwd,
+    launchProfile: args.launchProfile,
+  });
+  console.debug("[launcher] create_session end", {
+    projectId: args.projectId,
+    stackId: args.stackId,
   });
   return normalizeWorkspaceSnapshot(snapshot, args.projectId);
 }
@@ -244,6 +303,29 @@ export async function resizeSession(sessionId: string, cols: number, rows: numbe
   return invoke("resize_session", { sessionId, cols, rows });
 }
 
+export async function reportTabViewport(projectId: string, tabId: string, width: number, height: number) {
+  if (!isTauriRuntime()) {
+    mockState.tabViewports.set(tabViewportKey(projectId, tabId), { width, height });
+    return;
+  }
+
+  return invoke("report_tab_viewport", { projectId, tabId, width, height });
+}
+
+export async function readClipboardPayload(): Promise<PastePayload> {
+  if (!isTauriRuntime()) {
+    try {
+      const text = await navigator.clipboard.readText();
+      return text ? { kind: "text", text } : { kind: "empty" };
+    } catch {
+      return { kind: "empty" };
+    }
+  }
+
+  const payload = await invoke<unknown>("read_clipboard_payload");
+  return normalizePastePayload(payload);
+}
+
 function createMockState() {
   const projectA: Project = {
     id: "project-app",
@@ -278,6 +360,8 @@ function createMockState() {
       title: "server",
       program: "powershell",
       args: null,
+      launchProfile: "terminal",
+      tmuxShimEnabled: false,
       cwd: projectB.path,
       status: "running",
       startedAt: Date.now().toString(),
@@ -290,6 +374,8 @@ function createMockState() {
       title: "tests",
       program: "powershell",
       args: null,
+      launchProfile: "terminal",
+      tmuxShimEnabled: false,
       cwd: projectB.path,
       status: "running",
       startedAt: Date.now().toString(),
@@ -302,6 +388,8 @@ function createMockState() {
       title: "review-agent",
       program: "codex",
       args: ["--full-auto"],
+      launchProfile: "codexFullAuto",
+      tmuxShimEnabled: true,
       cwd: projectB.path,
       status: "running",
       startedAt: Date.now().toString(),
@@ -335,6 +423,7 @@ function createMockState() {
         },
       ],
     ]),
+    tabViewports: new Map<string, TabViewport>(),
     counter: 1,
   };
 }
@@ -416,6 +505,14 @@ function normalizeProject(value: unknown): Project {
   };
 }
 
+function normalizeDeleteProjectResult(value: unknown): DeleteProjectResult {
+  const record = asRecord(value);
+  return {
+    deletedProjectId: asString(record.deletedProjectId ?? record.deleted_project_id, ""),
+    nextProjectId: normalizeNullableString(record.nextProjectId ?? record.next_project_id),
+  };
+}
+
 function normalizeWorkspaceSnapshot(value: unknown, fallbackProjectId?: string): WorkspaceSnapshot {
   const record = asRecord(value);
   const projectId = asString(record.projectId ?? record.project_id, fallbackProjectId ?? nextId("project"));
@@ -460,13 +557,14 @@ function normalizeLayoutNode(
   const type = asString(record.type, "stack");
   if (type === "split") {
     const direction = asString(record.direction, "horizontal") === "vertical" ? "vertical" : "horizontal";
+    const zoneKind = normalizeSplitZoneKind(record.zoneKind ?? record.zone_kind);
     const childValues = Array.isArray(record.children) ? record.children : [];
     const children = childValues.length > 0
       ? childValues.map((child, index) => normalizeLayoutNode(child, fallbackOrdinal + index, fallbackOwner, fallbackLaunchState, fallbackSourcePaneId))
       : [createEmptyStack(fallbackOrdinal, fallbackOwner, fallbackSourcePaneId, fallbackLaunchState)];
-    const defaultSizes = direction === "vertical"
-      ? children.length === 2 ? [60, 40] : children.map((_child, index) => (index === 0 ? 100 - ((children.length - 1) * Math.floor(100 / children.length)) : Math.floor(100 / children.length)))
-      : children.length === 2 ? [55, 45] : children.map((_child, index) => (index === 0 ? 100 - ((children.length - 1) * Math.floor(100 / children.length)) : Math.floor(100 / children.length)));
+    const defaultSizes = children.length === 2
+      ? defaultSplitSizes(direction)
+      : children.map((_child, index) => (index === 0 ? 100 - ((children.length - 1) * Math.floor(100 / children.length)) : Math.floor(100 / children.length)));
     const sizes = Array.isArray(record.sizes) && record.sizes.length === children.length
       ? record.sizes.map((entry, index) => asNumber(entry, defaultSizes[index] ?? 50))
       : defaultSizes;
@@ -475,6 +573,7 @@ function normalizeLayoutNode(
       type: "split",
       id: asString(record.id, nextId("split")),
       direction,
+      zoneKind,
       sizes,
       children,
     };
@@ -527,6 +626,8 @@ function normalizeSession(value: unknown, fallbackProjectId: string): TerminalSe
     title: asString(record.title, "Terminal"),
     program: asString(record.program ?? record.shell, "powershell"),
     args: normalizeArgs(record.args ?? record.args_json),
+    launchProfile: normalizeLaunchProfile(record.launchProfile ?? record.launch_profile),
+    tmuxShimEnabled: Boolean(record.tmuxShimEnabled ?? record.tmux_shim_enabled),
     cwd: asString(record.cwd, "D:\\"),
     status: normalizeSessionStatus(record.status),
     startedAt: normalizeNullableString(record.startedAt ?? record.started_at),
@@ -541,6 +642,16 @@ function normalizeSession(value: unknown, fallbackProjectId: string): TerminalSe
 
 function normalizeSessionStatus(value: unknown): TerminalSession["status"] {
   return value === "starting" || value === "running" || value === "exited" || value === "failed" ? value : "failed";
+}
+
+function normalizeLaunchProfile(value: unknown): LaunchProfile {
+  return value === "claude"
+    || value === "claudeUnsafe"
+    || value === "codex"
+    || value === "codexFullAuto"
+    || value === "terminal"
+    ? value
+    : "terminal";
 }
 
 function normalizeArgs(value: unknown): string[] | null {
@@ -566,8 +677,38 @@ function normalizeLaunchState(value: unknown, fallback: PaneLaunchState): PaneLa
   return value === "launched" || value === "unlaunched" ? value : fallback;
 }
 
+function normalizeSplitZoneKind(value: unknown): SplitZoneKind {
+  return value === "aiWorkspace" ? "aiWorkspace" : "default";
+}
+
 function normalizeNullableString(value: unknown): string | null {
   return typeof value === "string" ? value : null;
+}
+
+function normalizePastePayload(value: unknown): PastePayload {
+  const record = asRecord(value);
+  if (record.kind === "files" && Array.isArray(record.paths)) {
+    return {
+      kind: "files",
+      paths: record.paths.filter((entry): entry is string => typeof entry === "string"),
+    };
+  }
+
+  if (record.kind === "imagePath" && typeof record.imagePath === "string") {
+    return {
+      kind: "imagePath",
+      imagePath: record.imagePath,
+    };
+  }
+
+  if (record.kind === "text" && typeof record.text === "string") {
+    return {
+      kind: "text",
+      text: record.text,
+    };
+  }
+
+  return { kind: "empty" };
 }
 
 function asRecord(value: unknown): Record<string, unknown> {
@@ -631,6 +772,7 @@ function splitMockNode(
       type: "split",
       id: nextId("split"),
       direction,
+      zoneKind: "default",
       sizes: defaultSplitSizes(direction),
       children: [current, createEmptyStack(tab.nextPaneOrdinal, createdBy, node.id)],
     };
@@ -737,6 +879,7 @@ function closeMockPane(node: LayoutNode, targetId: string): string[] | null {
 function clearMockStack(node: Extract<LayoutNode, { type: "stack" }>) {
   const itemId = nextId("item");
   node.activeItemId = itemId;
+  node.launchState = node.createdBy === "user" ? "unlaunched" : "launched";
   node.items = [
     {
       id: itemId,
@@ -804,7 +947,12 @@ function collectStackIds(node: LayoutNode): string[] {
 }
 
 function defaultSplitSizes(direction: SplitDirection): [number, number] {
-  return direction === "vertical" ? [60, 40] : [55, 45];
+  void direction;
+  return [50, 50];
+}
+
+function tabViewportKey(projectId: string, tabId: string) {
+  return `${projectId}:${tabId}`;
 }
 
 const mockColors = ["#0ea5e9", "#34d399", "#f97316", "#facc15"];

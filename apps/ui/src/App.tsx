@@ -1,8 +1,9 @@
 import type { ReactNode } from "react";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Group as PanelGroup, Panel, Separator as PanelResizeHandle } from "react-resizable-panels";
 import type {
   LayoutNode,
+  LaunchProfile,
   Project,
   StackItem,
   TerminalSession,
@@ -17,16 +18,25 @@ import {
   createSession,
   createTab,
   closeTab,
+  deleteProject,
   listProjects,
   openWorkspace,
+  reportTabViewport,
+  renameProject,
   renameTab,
   setActiveStackItem,
   setActiveTab,
   splitPane,
 } from "./lib/api";
-import { listenSessionExit, listenSessionOutput, openDirectoryDialog } from "./lib/desktop";
+import {
+  listenSessionExit,
+  listenSessionOutput,
+  listenWindowFileDrop,
+  listenWorkspaceChanged,
+  openDirectoryDialog,
+} from "./lib/desktop";
 import { getActiveTab, isSplitNode, isStackNode } from "./lib/layout";
-import { writeTerminalChunk } from "./lib/terminalRegistry";
+import { pasteTerminalInput, writeTerminalChunk } from "./lib/terminalRegistry";
 
 type LauncherProfile = {
   id: string;
@@ -34,6 +44,7 @@ type LauncherProfile = {
   description: string;
   program: string;
   args?: string[];
+  launchProfile: LaunchProfile;
   theme: "claude" | "claude-danger" | "codex" | "codex-auto" | "terminal";
   sessionTitle: string;
 };
@@ -45,6 +56,7 @@ const launcherRows: LauncherProfile[][] = [
       title: "Claude Code",
       description: "Interactive coding session",
       program: "claude",
+      launchProfile: "claude",
       theme: "claude",
       sessionTitle: "Claude Code",
     },
@@ -54,6 +66,7 @@ const launcherRows: LauncherProfile[][] = [
       description: "Bypass permissions",
       program: "claude",
       args: ["--dangerously-skip-permissions"],
+      launchProfile: "claudeUnsafe",
       theme: "claude-danger",
       sessionTitle: "Claude Unsafe",
     },
@@ -64,6 +77,7 @@ const launcherRows: LauncherProfile[][] = [
       title: "Codex",
       description: "Interactive agent session",
       program: "codex",
+      launchProfile: "codex",
       theme: "codex",
       sessionTitle: "Codex",
     },
@@ -73,6 +87,7 @@ const launcherRows: LauncherProfile[][] = [
       description: "Workspace-write auto mode",
       program: "codex",
       args: ["--full-auto"],
+      launchProfile: "codexFullAuto",
       theme: "codex-auto",
       sessionTitle: "Codex Full Auto",
     },
@@ -83,6 +98,7 @@ const launcherRows: LauncherProfile[][] = [
       title: "Terminal",
       description: "Plain PowerShell shell",
       program: "powershell",
+      launchProfile: "terminal",
       theme: "terminal",
       sessionTitle: "PowerShell",
     },
@@ -136,6 +152,21 @@ function collectPaneLabels(node: LayoutNode, paneLabels: Map<string, string>) {
   }
 }
 
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number, timeoutMessage: string) {
+  let timeoutId: number | null = null;
+  const timeoutPromise = new Promise<T>((_resolve, reject) => {
+    timeoutId = window.setTimeout(() => {
+      reject(new Error(timeoutMessage));
+    }, timeoutMs);
+  });
+
+  return Promise.race([promise, timeoutPromise]).finally(() => {
+    if (timeoutId !== null) {
+      window.clearTimeout(timeoutId);
+    }
+  });
+}
+
 export default function App() {
   const [projects, setProjects] = useState<Project[]>([]);
   const [activeProjectId, setActiveProjectId] = useState<string | null>(null);
@@ -146,6 +177,11 @@ export default function App() {
   const [newProjectPath, setNewProjectPath] = useState("");
   const [loading, setLoading] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [launchingPaneIds, setLaunchingPaneIds] = useState<string[]>([]);
+  const [renamingProjectId, setRenamingProjectId] = useState<string | null>(null);
+  const [renamingProjectName, setRenamingProjectName] = useState("");
+  const [pendingDeleteProject, setPendingDeleteProject] = useState<Project | null>(null);
+  const workspaceCanvasRef = useRef<HTMLElement | null>(null);
 
   const sessions = useMemo(() => createSessionMap(snapshot), [snapshot]);
   const activeProject = useMemo(
@@ -207,12 +243,103 @@ export default function App() {
       }
     }).then((dispose) => disposers.push(dispose));
 
+    void listenWorkspaceChanged((event) => {
+      if (!activeProjectId || event.payload.projectId !== activeProjectId) {
+        return;
+      }
+
+      void (async () => {
+        try {
+          const nextSnapshot = await openWorkspace(activeProjectId);
+          setSnapshot(nextSnapshot);
+        } catch (error) {
+          showError(error);
+        }
+      })();
+    }).then((dispose) => disposers.push(dispose));
+
     return () => {
       for (const dispose of disposers) {
         dispose();
       }
     };
   }, [activeProjectId]);
+
+  useEffect(() => {
+    const element = workspaceCanvasRef.current;
+    if (!element || !activeProjectId || !activeTab) {
+      return;
+    }
+
+    let frame: number | null = null;
+    let lastWidth = 0;
+    let lastHeight = 0;
+
+    const sendViewport = () => {
+      frame = null;
+      const rect = element.getBoundingClientRect();
+      const width = Math.round(rect.width);
+      const height = Math.round(rect.height);
+      if (width <= 0 || height <= 0) {
+        return;
+      }
+      if (width === lastWidth && height === lastHeight) {
+        return;
+      }
+      lastWidth = width;
+      lastHeight = height;
+      void reportTabViewport(activeProjectId, activeTab.id, width, height).catch((error) => {
+        const message = error instanceof Error ? error.message : String(error);
+        setErrorMessage(message);
+      });
+    };
+
+    const scheduleViewportReport = () => {
+      if (frame !== null) {
+        cancelAnimationFrame(frame);
+      }
+      frame = requestAnimationFrame(sendViewport);
+    };
+
+    const observer = new ResizeObserver(() => {
+      scheduleViewportReport();
+    });
+    observer.observe(element);
+    scheduleViewportReport();
+
+    return () => {
+      observer.disconnect();
+      if (frame !== null) {
+        cancelAnimationFrame(frame);
+      }
+    };
+  }, [activeProjectId, activeTab]);
+
+  useEffect(() => {
+    let dispose: (() => void) | null = null;
+
+    void listenWindowFileDrop((event) => {
+      if (event.type !== "drop" || !event.paths.length || !event.position) {
+        return;
+      }
+
+      const scale = window.devicePixelRatio || 1;
+      const target = document.elementFromPoint(event.position.x / scale, event.position.y / scale);
+      const terminalHost = target?.closest<HTMLElement>("[data-terminal-session-id]");
+      const sessionId = terminalHost?.dataset.terminalSessionId;
+      if (!sessionId) {
+        return;
+      }
+
+      pasteTerminalInput(sessionId, event.paths.join(" "));
+    }).then((unlisten) => {
+      dispose = unlisten;
+    });
+
+    return () => {
+      dispose?.();
+    };
+  }, []);
 
   async function selectProject(projectId: string) {
     await loadWorkspace(projectId);
@@ -301,7 +428,105 @@ export default function App() {
     setNewProjectPath("");
   }
 
+  async function launchFromPane(
+    paneId: string,
+    profile: LauncherProfile,
+  ) {
+    if (!activeProjectId || !activeTab || launchingPaneIds.includes(paneId)) {
+      return;
+    }
+
+    setLaunchingPaneIds((current) => [...current, paneId]);
+    try {
+      console.debug("[launcher] click", {
+        paneId,
+        profileId: profile.id,
+        program: profile.program,
+        args: profile.args ?? [],
+      });
+      await refreshWorkspace(
+        withTimeout(
+          createSession({
+            projectId: activeProjectId,
+            tabId: activeTab.id,
+            stackId: paneId,
+            title: profile.sessionTitle,
+            program: profile.program,
+            args: profile.args,
+            launchProfile: profile.launchProfile,
+          }),
+          12000,
+          "Session start timed out. The launcher was unlocked so you can try again.",
+        ),
+      );
+      setErrorMessage(null);
+    } catch (error) {
+      showError(error);
+    } finally {
+      setLaunchingPaneIds((current) => current.filter((entry) => entry !== paneId));
+    }
+  }
+
+  function beginRenameProject(project: Project) {
+    setErrorMessage(null);
+    setRenamingProjectId(project.id);
+    setRenamingProjectName(project.name);
+  }
+
+  function cancelRenameProject() {
+    setRenamingProjectId(null);
+    setRenamingProjectName("");
+  }
+
+  async function commitRenameProject(projectId: string) {
+    if (renamingProjectId !== projectId) {
+      return;
+    }
+
+    const nextName = renamingProjectName.trim();
+    if (!nextName) {
+      setErrorMessage("Project name cannot be empty.");
+      cancelRenameProject();
+      return;
+    }
+
+    try {
+      setErrorMessage(null);
+      const updatedProject = await renameProject(projectId, nextName);
+      setProjects((current) => current.map((project) => (project.id === updatedProject.id ? updatedProject : project)));
+      cancelRenameProject();
+    } catch (error) {
+      showError(error);
+      cancelRenameProject();
+    }
+  }
+
+  async function confirmDeleteProject() {
+    if (!pendingDeleteProject) {
+      return;
+    }
+
+    try {
+      setErrorMessage(null);
+      cancelRenameProject();
+      const result = await deleteProject(pendingDeleteProject.id);
+      setPendingDeleteProject(null);
+      setProjects((current) => current.filter((project) => project.id !== result.deletedProjectId));
+
+      if (result.nextProjectId) {
+        await loadWorkspace(result.nextProjectId);
+        return;
+      }
+
+      setActiveProjectId(null);
+      setSnapshot(null);
+    } catch (error) {
+      showError(error);
+    }
+  }
+
   function renderLauncher(node: Extract<LayoutNode, { type: "stack" }>) {
+    const isLaunching = launchingPaneIds.includes(node.id);
     return (
       <div className="launcher-surface">
         <div className="launcher-header">
@@ -324,22 +549,15 @@ export default function App() {
                 <button
                   key={profile.id}
                   className={`launcher-tile ${profile.theme}`}
+                  disabled={isLaunching}
                   onClick={() => {
-                    if (!activeProjectId || !activeTab) return;
-                    void refreshWorkspace(
-                      createSession({
-                        projectId: activeProjectId,
-                        tabId: activeTab.id,
-                        stackId: node.id,
-                        title: profile.sessionTitle,
-                        program: profile.program,
-                        args: profile.args,
-                      }),
-                    );
+                    void launchFromPane(node.id, profile);
                   }}
                 >
                   <span className="launcher-tile-title">{profile.title}</span>
-                  <span className="launcher-tile-desc">{profile.description}</span>
+                  <span className="launcher-tile-desc">
+                    {isLaunching ? "Starting session..." : profile.description}
+                  </span>
                 </button>
               ))}
             </div>
@@ -495,6 +713,7 @@ export default function App() {
                       title: session.title,
                       program: session.program,
                       args: session.args ?? undefined,
+                      launchProfile: session.launchProfile,
                     }),
                   );
                 }}
@@ -514,6 +733,7 @@ export default function App() {
                       projectId: activeProjectId,
                       tabId: activeTab.id,
                       stackId: node.id,
+                      launchProfile: "terminal",
                     }),
                   );
                 }}
@@ -543,18 +763,70 @@ export default function App() {
         {errorMessage ? <div className="error-banner">{errorMessage}</div> : null}
         <div className="project-list">
           {projects.map((project) => (
-            <button
+            <div
               key={project.id}
               className={`project-card ${project.id === activeProjectId ? "active" : ""}`}
-              title={`${project.name}\n${project.path}`}
-              onClick={() => void selectProject(project.id)}
             >
               <span className="project-color" style={{ background: project.color }} />
-              <div>
-                <strong>{project.name}</strong>
-                <div className="project-path" title={project.path}>{project.path}</div>
+              {renamingProjectId === project.id ? (
+                <div className="project-card-main project-card-main-static">
+                  <div className="project-card-content">
+                    <input
+                      className="project-inline-input"
+                      value={renamingProjectName}
+                      onChange={(event) => setRenamingProjectName(event.target.value)}
+                      onBlur={() => {
+                        void commitRenameProject(project.id);
+                      }}
+                      onKeyDown={(event) => {
+                        if (event.key === "Enter") {
+                          event.preventDefault();
+                          void commitRenameProject(project.id);
+                        }
+                        if (event.key === "Escape") {
+                          event.preventDefault();
+                          cancelRenameProject();
+                        }
+                      }}
+                      autoFocus
+                    />
+                  </div>
+                </div>
+              ) : (
+                <button
+                  className="project-card-main"
+                  title={`${project.name}\n${project.path}`}
+                  onClick={() => void selectProject(project.id)}
+                >
+                  <div className="project-card-content">
+                    <strong>{project.name}</strong>
+                    <div className="project-path" title={project.path}>{project.path}</div>
+                  </div>
+                </button>
+              )}
+              <div className="project-card-actions">
+                <button
+                  className="project-action-button"
+                  title="Rename project"
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    beginRenameProject(project);
+                  }}
+                >
+                  Rename
+                </button>
+                <button
+                  className="project-action-button danger"
+                  title="Remove project from Workspace Terminal"
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    setPendingDeleteProject(project);
+                  }}
+                >
+                  Delete
+                </button>
               </div>
-            </button>
+            </div>
           ))}
         </div>
       </aside>
@@ -603,7 +875,16 @@ export default function App() {
           ))}
         </div>
 
-        <section className="workspace-canvas">
+        <section
+          className="workspace-canvas"
+          ref={workspaceCanvasRef}
+          onDragOver={(event) => {
+            event.preventDefault();
+          }}
+          onDrop={(event) => {
+            event.preventDefault();
+          }}
+        >
           {loading ? (
             <div className="empty-state">Loading workspace...</div>
           ) : activeTab ? (
@@ -668,6 +949,40 @@ export default function App() {
                   Add Project
                 </button>
               </div>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {pendingDeleteProject ? (
+        <div
+          className="modal-backdrop"
+          onClick={(event) => {
+            if (event.target === event.currentTarget) {
+              setPendingDeleteProject(null);
+            }
+          }}
+        >
+          <div className="modal-card modal-card-compact">
+            <div className="modal-header">
+              <div>
+                <p className="eyebrow">Remove Project</p>
+                <h3>{pendingDeleteProject.name}</h3>
+              </div>
+              <button className="toolbar-button" onClick={() => setPendingDeleteProject(null)}>
+                Close
+              </button>
+            </div>
+            <p className="modal-copy">
+              This removes the project from Workspace Terminal only. The actual folder stays on disk.
+            </p>
+            <div className="modal-actions">
+              <button className="toolbar-button" onClick={() => setPendingDeleteProject(null)}>
+                Cancel
+              </button>
+              <button className="toolbar-button subtle" onClick={() => void confirmDeleteProject()}>
+                Delete Project
+              </button>
             </div>
           </div>
         </div>

@@ -41,3 +41,13 @@ export function writeTerminalChunk(sessionId: string, chunk: string) {
 export function fitTerminal(sessionId: string) {
   terminals.get(sessionId)?.fit.fit();
 }
+
+export function pasteTerminalInput(sessionId: string, text: string) {
+  const entry = terminals.get(sessionId);
+  if (!entry || !text) {
+    return false;
+  }
+
+  entry.term.paste(text);
+  return true;
+}
