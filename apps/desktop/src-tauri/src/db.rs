@@ -5,7 +5,9 @@ use uuid::Uuid;
 
 use crate::{
     layout::{new_workspace_tab, normalize_tab, reset_tab_layout},
-    models::{Project, SessionStatus, TerminalSession, WorkspaceSnapshot, WorkspaceTab},
+    models::{
+        LaunchProfile, Project, SessionStatus, TerminalSession, WorkspaceSnapshot, WorkspaceTab,
+    },
 };
 
 pub struct Database {
@@ -43,6 +45,8 @@ impl Database {
               shell TEXT NOT NULL,
               program TEXT,
               args_json TEXT,
+              launch_profile TEXT,
+              tmux_shim_enabled INTEGER NOT NULL DEFAULT 0,
               cwd TEXT NOT NULL,
               status TEXT NOT NULL,
               started_at TEXT,
@@ -55,6 +59,11 @@ impl Database {
 
         let _ = conn.execute("ALTER TABLE sessions ADD COLUMN program TEXT", []);
         let _ = conn.execute("ALTER TABLE sessions ADD COLUMN args_json TEXT", []);
+        let _ = conn.execute("ALTER TABLE sessions ADD COLUMN launch_profile TEXT", []);
+        let _ = conn.execute(
+            "ALTER TABLE sessions ADD COLUMN tmux_shim_enabled INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
 
         Ok(Self { conn })
     }
@@ -151,6 +160,35 @@ impl Database {
         Ok(())
     }
 
+    pub fn rename_project(&self, project_id: &str, name: &str) -> Result<Project, String> {
+        self.conn
+            .execute(
+                "UPDATE projects SET name = ?1 WHERE id = ?2",
+                params![name, project_id],
+            )
+            .map_err(|err| err.to_string())?;
+
+        self.get_project(project_id)?
+            .ok_or_else(|| "Project not found".to_string())
+    }
+
+    pub fn delete_project(&mut self, project_id: &str) -> Result<(), String> {
+        let tx = self.conn.transaction().map_err(|err| err.to_string())?;
+        tx.execute(
+            "DELETE FROM sessions WHERE project_id = ?1",
+            params![project_id],
+        )
+        .map_err(|err| err.to_string())?;
+        tx.execute(
+            "DELETE FROM workspaces WHERE project_id = ?1",
+            params![project_id],
+        )
+        .map_err(|err| err.to_string())?;
+        tx.execute("DELETE FROM projects WHERE id = ?1", params![project_id])
+            .map_err(|err| err.to_string())?;
+        tx.commit().map_err(|err| err.to_string())
+    }
+
     pub fn load_workspace(&self, project_id: &str) -> Result<WorkspaceSnapshot, String> {
         let mut stmt = self
             .conn
@@ -233,15 +271,17 @@ impl Database {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT id, project_id, title, COALESCE(program, shell), args_json, cwd, status, started_at, ended_at, exit_code
+                "SELECT id, project_id, title, COALESCE(program, shell), args_json, launch_profile, tmux_shim_enabled, cwd, status, started_at, ended_at, exit_code
                  FROM sessions WHERE project_id = ?1 ORDER BY COALESCE(started_at, ended_at) DESC",
             )
             .map_err(|err| err.to_string())?;
 
         let rows = stmt
             .query_map(params![project_id], |row| {
-                let status_str: String = row.get(6)?;
                 let args_json: Option<String> = row.get(4)?;
+                let launch_profile_str: Option<String> = row.get(5)?;
+                let tmux_shim_enabled: i64 = row.get(6)?;
+                let status_str: String = row.get(8)?;
                 Ok(TerminalSession {
                     id: row.get(0)?,
                     project_id: row.get(1)?,
@@ -258,16 +298,18 @@ impl Database {
                                 Box::new(err),
                             )
                         })?,
-                    cwd: row.get(5)?,
+                    launch_profile: parse_launch_profile(launch_profile_str.as_deref()),
+                    tmux_shim_enabled: tmux_shim_enabled != 0,
+                    cwd: row.get(7)?,
                     status: match status_str.as_str() {
                         "running" => SessionStatus::Running,
                         "exited" => SessionStatus::Exited,
                         "failed" => SessionStatus::Failed,
                         _ => SessionStatus::Starting,
                     },
-                    started_at: row.get(7)?,
-                    ended_at: row.get(8)?,
-                    exit_code: row.get(9)?,
+                    started_at: row.get(9)?,
+                    ended_at: row.get(10)?,
+                    exit_code: row.get(11)?,
                 })
             })
             .map_err(|err| err.to_string())?;
@@ -287,13 +329,15 @@ impl Database {
         self.conn
             .execute(
                 r#"
-                INSERT INTO sessions (id, project_id, title, shell, program, args_json, cwd, status, started_at, ended_at, exit_code)
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                INSERT INTO sessions (id, project_id, title, shell, program, args_json, launch_profile, tmux_shim_enabled, cwd, status, started_at, ended_at, exit_code)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
                 ON CONFLICT(id) DO UPDATE SET
                   title = excluded.title,
                   shell = excluded.shell,
                   program = excluded.program,
                   args_json = excluded.args_json,
+                  launch_profile = excluded.launch_profile,
+                  tmux_shim_enabled = excluded.tmux_shim_enabled,
                   cwd = excluded.cwd,
                   status = excluded.status,
                   started_at = excluded.started_at,
@@ -307,6 +351,8 @@ impl Database {
                     session.program,
                     session.program,
                     args_json,
+                    launch_profile_to_str(&session.launch_profile),
+                    if session.tmux_shim_enabled { 1_i64 } else { 0_i64 },
                     session.cwd,
                     status_to_str(&session.status),
                     session.started_at,
@@ -362,5 +408,25 @@ pub fn status_to_str(status: &SessionStatus) -> &'static str {
         SessionStatus::Running => "running",
         SessionStatus::Exited => "exited",
         SessionStatus::Failed => "failed",
+    }
+}
+
+fn launch_profile_to_str(profile: &LaunchProfile) -> &'static str {
+    match profile {
+        LaunchProfile::Terminal => "terminal",
+        LaunchProfile::Claude => "claude",
+        LaunchProfile::ClaudeUnsafe => "claudeUnsafe",
+        LaunchProfile::Codex => "codex",
+        LaunchProfile::CodexFullAuto => "codexFullAuto",
+    }
+}
+
+fn parse_launch_profile(raw: Option<&str>) -> LaunchProfile {
+    match raw.unwrap_or("terminal") {
+        "claude" => LaunchProfile::Claude,
+        "claudeUnsafe" => LaunchProfile::ClaudeUnsafe,
+        "codex" => LaunchProfile::Codex,
+        "codexFullAuto" => LaunchProfile::CodexFullAuto,
+        _ => LaunchProfile::Terminal,
     }
 }

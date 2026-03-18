@@ -1,5 +1,16 @@
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum LaunchProfile {
+    #[default]
+    Terminal,
+    Claude,
+    ClaudeUnsafe,
+    Codex,
+    CodexFullAuto,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Project {
@@ -10,6 +21,13 @@ pub struct Project {
     pub icon: Option<String>,
     pub last_opened_at: Option<String>,
     pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteProjectResult {
+    pub deleted_project_id: String,
+    pub next_project_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -30,6 +48,10 @@ pub struct TerminalSession {
     pub program: String,
     #[serde(default)]
     pub args: Option<Vec<String>>,
+    #[serde(default)]
+    pub launch_profile: LaunchProfile,
+    #[serde(default)]
+    pub tmux_shim_enabled: bool,
     pub cwd: String,
     pub status: SessionStatus,
     pub started_at: Option<String>,
@@ -62,6 +84,14 @@ pub enum PaneLaunchState {
     Launched,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum SplitZoneKind {
+    #[default]
+    Default,
+    AiWorkspace,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum LayoutNode {
@@ -69,6 +99,8 @@ pub enum LayoutNode {
     Split {
         id: String,
         direction: String,
+        #[serde(default)]
+        zone_kind: SplitZoneKind,
         sizes: Vec<u16>,
         children: Vec<LayoutNode>,
     },
@@ -116,6 +148,12 @@ pub struct WorkspaceSnapshot {
 pub struct SessionOutputEvent {
     pub session_id: String,
     pub chunk: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceChangedEvent {
+    pub project_id: String,
 }
 
 #[derive(Debug, Clone, Serialize)]

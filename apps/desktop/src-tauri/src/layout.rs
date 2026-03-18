@@ -2,7 +2,21 @@ use std::collections::HashSet;
 
 use uuid::Uuid;
 
-use crate::models::{LayoutNode, PaneCreatedBy, PaneLaunchState, StackItem, WorkspaceTab};
+use crate::models::{
+    LayoutNode, PaneCreatedBy, PaneLaunchState, SplitZoneKind, StackItem, WorkspaceTab,
+};
+
+pub enum CloseSessionResult {
+    NotFound,
+    Updated,
+    RootRemoved,
+}
+
+pub enum ClosePaneResult {
+    NotFound,
+    Updated(Vec<String>),
+    RootRemoved(Vec<String>),
+}
 
 pub fn new_workspace_tab(title: String) -> WorkspaceTab {
     let root = new_stack_node(1, PaneCreatedBy::User, None);
@@ -50,7 +64,9 @@ pub fn normalize_tab(tab: &mut WorkspaceTab) -> bool {
     );
 
     let expected_active_pane_id = match &tab.active_pane_id {
-        Some(active_pane_id) if stack_exists(&tab.root, active_pane_id) => Some(active_pane_id.clone()),
+        Some(active_pane_id) if stack_exists(&tab.root, active_pane_id) => {
+            Some(active_pane_id.clone())
+        }
         _ => first_stack_id(&tab.root),
     };
 
@@ -97,16 +113,50 @@ pub fn split_stack_node(
             *node = LayoutNode::Split {
                 id: Uuid::new_v4().to_string(),
                 direction: direction.to_string(),
+                zone_kind: SplitZoneKind::Default,
                 sizes: default_sizes_for_child_count(direction, 2),
                 children: vec![current, new_child],
             };
             true
         }
-        LayoutNode::Split { children, .. } => children
-            .iter_mut()
-            .any(|child| split_stack_node(child, target_id, direction, next_pane_ordinal, created_by.clone())),
+        LayoutNode::Split { children, .. } => children.iter_mut().any(|child| {
+            split_stack_node(
+                child,
+                target_id,
+                direction,
+                next_pane_ordinal,
+                created_by.clone(),
+            )
+        }),
         _ => false,
     }
+}
+
+pub fn wrap_root_with_ai_workspace(
+    tab: &mut WorkspaceTab,
+    direction: &str,
+    source_pane_id: Option<String>,
+) -> String {
+    let current_root = tab.root.clone();
+    let new_ai_stack = new_stack_node(
+        allocate_pane_ordinal(&mut tab.next_pane_ordinal),
+        PaneCreatedBy::Ai,
+        source_pane_id,
+    );
+    let new_ai_stack_id = match &new_ai_stack {
+        LayoutNode::Stack { id, .. } => id.clone(),
+        LayoutNode::Split { .. } => unreachable!("new_stack_node must create a stack"),
+    };
+
+    tab.root = LayoutNode::Split {
+        id: Uuid::new_v4().to_string(),
+        direction: direction.to_string(),
+        zone_kind: SplitZoneKind::AiWorkspace,
+        sizes: default_sizes_for_child_count(direction, 2),
+        children: vec![current_root, new_ai_stack],
+    };
+
+    new_ai_stack_id
 }
 
 pub fn add_session_to_stack(
@@ -208,40 +258,46 @@ pub fn collect_session_ids(node: &LayoutNode, session_ids: &mut Vec<String>) {
     }
 }
 
+pub fn find_stack_id_for_session(node: &LayoutNode, session_id: &str) -> Option<String> {
+    match node {
+        LayoutNode::Stack { id, items, .. } => items
+            .iter()
+            .any(|item| item.session_id.as_deref() == Some(session_id))
+            .then(|| id.clone()),
+        LayoutNode::Split { children, .. } => children
+            .iter()
+            .find_map(|child| find_stack_id_for_session(child, session_id)),
+    }
+}
+
 pub fn close_session_in_layout(
     node: &mut LayoutNode,
     target_stack_id: &str,
     session_id: &str,
-) -> bool {
+) -> CloseSessionResult {
     let mutation = remove_session(node, target_stack_id, session_id);
     match mutation {
-        LayoutMutation::Unchanged => false,
-        LayoutMutation::Updated => true,
+        LayoutMutation::Unchanged => CloseSessionResult::NotFound,
+        LayoutMutation::Updated => CloseSessionResult::Updated,
         LayoutMutation::Replace(next) => {
             *node = next;
-            true
+            CloseSessionResult::Updated
         }
-        LayoutMutation::RemoveNode => {
-            clear_root_stack(node);
-            true
-        }
+        LayoutMutation::RemoveNode => CloseSessionResult::RootRemoved,
     }
 }
 
-pub fn close_stack_node(node: &mut LayoutNode, target_stack_id: &str) -> Option<Vec<String>> {
+pub fn close_stack_node(node: &mut LayoutNode, target_stack_id: &str) -> ClosePaneResult {
     let mut session_ids = Vec::new();
     let mutation = remove_stack(node, target_stack_id, &mut session_ids);
     match mutation {
-        LayoutMutation::Unchanged => None,
-        LayoutMutation::Updated => Some(session_ids),
+        LayoutMutation::Unchanged => ClosePaneResult::NotFound,
+        LayoutMutation::Updated => ClosePaneResult::Updated(session_ids),
         LayoutMutation::Replace(next) => {
             *node = next;
-            Some(session_ids)
+            ClosePaneResult::Updated(session_ids)
         }
-        LayoutMutation::RemoveNode => {
-            clear_root_stack(node);
-            Some(session_ids)
-        }
+        LayoutMutation::RemoveNode => ClosePaneResult::RootRemoved(session_ids),
     }
 }
 
@@ -367,24 +423,6 @@ fn empty_stack_item() -> StackItem {
     }
 }
 
-fn clear_root_stack(node: &mut LayoutNode) {
-    match node {
-        LayoutNode::Stack {
-            active_item_id,
-            items,
-            ..
-        } => {
-            let item = empty_stack_item();
-            *active_item_id = item.id.clone();
-            items.clear();
-            items.push(item);
-        }
-        _ => {
-            *node = new_stack_node(1, PaneCreatedBy::User, None);
-        }
-    }
-}
-
 fn default_launch_state(created_by: &PaneCreatedBy) -> PaneLaunchState {
     match created_by {
         PaneCreatedBy::User => PaneLaunchState::Unlaunched,
@@ -394,8 +432,8 @@ fn default_launch_state(created_by: &PaneCreatedBy) -> PaneLaunchState {
 
 fn default_split_sizes(direction: &str) -> Vec<u16> {
     match direction {
-        "vertical" => vec![60, 40],
-        "horizontal" => vec![55, 45],
+        "vertical" => vec![50, 50],
+        "horizontal" => vec![50, 50],
         _ => vec![50, 50],
     }
 }
@@ -551,5 +589,67 @@ fn remove_stack(
             LayoutMutation::Updated
         }
         _ => LayoutMutation::Unchanged,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{first_stack_id, new_workspace_tab, split_stack_node, wrap_root_with_ai_workspace};
+    use crate::models::{LayoutNode, PaneCreatedBy, SplitZoneKind};
+
+    #[test]
+    fn split_stack_node_uses_equal_sizes_and_default_zone() {
+        let mut tab = new_workspace_tab("main".to_string());
+        let root_stack_id = first_stack_id(&tab.root).expect("root stack");
+
+        assert!(split_stack_node(
+            &mut tab.root,
+            &root_stack_id,
+            "horizontal",
+            &mut tab.next_pane_ordinal,
+            PaneCreatedBy::User,
+        ));
+
+        match &tab.root {
+            LayoutNode::Split {
+                sizes, zone_kind, ..
+            } => {
+                assert_eq!(sizes, &vec![50, 50]);
+                assert_eq!(zone_kind, &SplitZoneKind::Default);
+            }
+            LayoutNode::Stack { .. } => panic!("expected split root"),
+        }
+    }
+
+    #[test]
+    fn wrap_root_with_ai_workspace_creates_ai_zone() {
+        let mut tab = new_workspace_tab("main".to_string());
+        let source_id = first_stack_id(&tab.root).expect("root stack");
+        let new_ai_pane_id =
+            wrap_root_with_ai_workspace(&mut tab, "horizontal", Some(source_id.clone()));
+
+        match &tab.root {
+            LayoutNode::Split {
+                sizes,
+                zone_kind,
+                children,
+                ..
+            } => {
+                assert_eq!(sizes, &vec![50, 50]);
+                assert_eq!(zone_kind, &SplitZoneKind::AiWorkspace);
+                assert_eq!(children.len(), 2);
+                assert!(matches!(
+                    &children[1],
+                    LayoutNode::Stack {
+                        id,
+                        created_by: PaneCreatedBy::Ai,
+                        source_pane_id: current_source_pane_id,
+                        ..
+                    } if id == &new_ai_pane_id
+                        && current_source_pane_id.as_deref() == Some(source_id.as_str())
+                ));
+            }
+            LayoutNode::Stack { .. } => panic!("expected ai workspace split root"),
+        }
     }
 }

@@ -12,7 +12,8 @@
     "build": "npm run build --workspace packages/contracts && npm run build --workspace apps/ui",
     "lint": "npm run lint --workspace apps/ui",
     "tauri:dev": "npm exec tauri dev -- --config apps/desktop/src-tauri/tauri.conf.json",
-    "tauri:build": "npm exec tauri build -- --config apps/desktop/src-tauri/tauri.conf.json"
+    "tauri:build": "npm exec tauri build -- --config apps/desktop/src-tauri/tauri.conf.json",
+    "portable:refresh": "powershell -NoProfile -ExecutionPolicy Bypass -File ./scripts/refresh-portable.ps1"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2.3.1"
