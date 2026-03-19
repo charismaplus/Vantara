@@ -32,6 +32,16 @@
    코드베이스 구조, 개발 규칙, 품질 기준, 테스트 전략
 10. [10-delivery-workstreams.md](./10-delivery-workstreams.md)
    구현 작업 스트림, 선행 관계, 제품 완료 기준
+11. [11-ai-pane-creation-policy.md](./11-ai-pane-creation-policy.md)
+   AI pane 생성 방향/크기/fallback 정책
+12. [12-portable-release-workflow.md](./12-portable-release-workflow.md)
+   포터블 exe 단일 경로 배포 규칙과 해시 검증 워크플로
+13. [13-tmux-shim-integration.md](./13-tmux-shim-integration.md)
+   tmux 호환 shim 런타임 구조, 명령 매핑, 보안/배포 규칙
+14. [14-tmux-command-flags-and-compatibility-policy.md](./14-tmux-command-flags-and-compatibility-policy.md)
+   tmux 전체 명령 family, 주요 플래그 semantics, 현재 shim 매핑, exact/degraded 정책 기준
+15. [15-tmux-implementation-backlog.md](./15-tmux-implementation-backlog.md)
+   tmux shim 구현 완료 범위, synthetic surface, 다음 구현 후보와 unsupported 경계
 
 문서 사용 원칙:
 
