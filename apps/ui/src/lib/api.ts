@@ -6,23 +6,30 @@ import type {
   PaneLaunchState,
   PastePayload,
   Project,
+  ProjectWorkspaceSnapshot,
   StackItem,
   TerminalSession,
+  WorkspaceSession,
+  WorkspaceSessionCreatedBy,
   WorkspaceSnapshot,
   WorkspaceTab,
-} from "@workspace-terminal/contracts";
+} from "../../../../packages/contracts/src/index.ts";
 
 import { isTauriRuntime } from "./runtime";
 
 type SplitDirection = "horizontal" | "vertical";
-type PaneOwner = "user" | "ai";
-type SplitZoneKind = "default" | "aiWorkspace";
-type TabViewport = { width: number; height: number };
+
+type CreateWorkspaceSessionArgs = {
+  name?: string;
+  createdBy?: WorkspaceSessionCreatedBy;
+  sourceSessionId?: string | null;
+};
 
 type CreateSessionArgs = {
   projectId: string;
-  tabId: string;
-  stackId: string;
+  workspaceSessionId: string;
+  windowId?: string | null;
+  stackId?: string | null;
   title?: string;
   program?: string;
   args?: string[] | null;
@@ -30,7 +37,13 @@ type CreateSessionArgs = {
   launchProfile?: LaunchProfile;
 };
 
-let mockCounter = 0;
+type MockState = {
+  counter: number;
+  projects: Project[];
+  projectSnapshots: Map<string, ProjectWorkspaceSnapshot>;
+  sessionSnapshots: Map<string, WorkspaceSnapshot>;
+};
+
 const mockState = createMockState();
 
 export async function listProjects() {
@@ -48,25 +61,19 @@ export async function createProject(name: string, path: string) {
       id: nextId("project"),
       name,
       path,
-      color: mockColors[mockState.projects.length % mockColors.length],
+      color: "#0ea5e9",
       icon: null,
-      lastOpenedAt: Date.now().toString(),
-      createdAt: Date.now().toString(),
+      lastOpenedAt: now(),
+      createdAt: now(),
     };
-
-    const defaultTab = createMockTab("main");
+    const session = createMockWorkspaceSession(project.id, "main", "user", null);
     mockState.projects.unshift(project);
-    mockState.workspaces.set(project.id, {
-      projectId: project.id,
-      activeTabId: defaultTab.id,
-      tabs: [defaultTab],
-      sessions: [],
-    });
+    mockState.projectSnapshots.set(project.id, { projectId: project.id, sessions: [session] });
+    mockState.sessionSnapshots.set(session.id, createEmptySessionSnapshot(project.id, session.id));
     return project;
   }
 
-  const project = await invoke<unknown>("create_project", { name, path });
-  return normalizeProject(project);
+  return normalizeProject(await invoke("create_project", { name, path }));
 }
 
 export async function renameProject(projectId: string, name: string) {
@@ -76,16 +83,12 @@ export async function renameProject(projectId: string, name: string) {
   }
 
   if (!isTauriRuntime()) {
-    const project = mockState.projects.find((entry) => entry.id === projectId);
-    if (!project) {
-      throw new Error("Project not found");
-    }
+    const project = requireProject(projectId);
     project.name = nextName;
     return { ...project };
   }
 
-  const project = await invoke<unknown>("rename_project", { projectId, name: nextName });
-  return normalizeProject(project);
+  return normalizeProject(await invoke("rename_project", { projectId, name: nextName }));
 }
 
 export async function deleteProject(projectId: string) {
@@ -94,192 +97,277 @@ export async function deleteProject(projectId: string) {
     if (index < 0) {
       throw new Error("Project not found");
     }
-
     const nextProjectId = mockState.projects[index + 1]?.id ?? mockState.projects[index - 1]?.id ?? null;
+    const projectSnapshot = mockState.projectSnapshots.get(projectId);
+    for (const session of projectSnapshot?.sessions ?? []) {
+      mockState.sessionSnapshots.delete(session.id);
+    }
+    mockState.projectSnapshots.delete(projectId);
     mockState.projects.splice(index, 1);
-    mockState.workspaces.delete(projectId);
-    return {
-      deletedProjectId: projectId,
-      nextProjectId,
-    } satisfies DeleteProjectResult;
+    return { deletedProjectId: projectId, nextProjectId } satisfies DeleteProjectResult;
   }
 
-  const result = await invoke<unknown>("delete_project", { projectId });
-  return normalizeDeleteProjectResult(result);
+  return normalizeDeleteProjectResult(await invoke("delete_project", { projectId }));
 }
 
-export async function openWorkspace(projectId: string) {
+export async function openProject(projectId: string) {
   if (!isTauriRuntime()) {
-    const snapshot = getMockWorkspace(projectId);
-    const project = mockState.projects.find((entry) => entry.id === projectId);
-    if (project) {
-      project.lastOpenedAt = Date.now().toString();
+    return cloneProjectSnapshot(getMockProjectSnapshot(projectId));
+  }
+
+  return normalizeProjectWorkspaceSnapshot(await invoke("open_project", { projectId }), projectId);
+}
+
+export async function openSession(projectId: string, workspaceSessionId: string) {
+  if (!isTauriRuntime()) {
+    touchMockSession(projectId, workspaceSessionId);
+    return cloneSessionSnapshot(getMockSessionSnapshot(projectId, workspaceSessionId));
+  }
+
+  return normalizeSessionWorkspaceSnapshot(
+    await invoke("open_session", { projectId, workspaceSessionId }),
+    projectId,
+    workspaceSessionId,
+  );
+}
+
+export async function createWorkspaceSession(projectId: string, args: CreateWorkspaceSessionArgs = {}) {
+  if (!isTauriRuntime()) {
+    const snapshot = getMockProjectSnapshot(projectId);
+    const session = createMockWorkspaceSession(
+      projectId,
+      args.name ?? `session-${snapshot.sessions.length + 1}`,
+      args.createdBy ?? "user",
+      args.sourceSessionId ?? null,
+    );
+    snapshot.sessions.unshift(session);
+    mockState.sessionSnapshots.set(session.id, createEmptySessionSnapshot(projectId, session.id));
+    return { ...session };
+  }
+
+  return normalizeWorkspaceSession(
+    await invoke("create_workspace_session", {
+      projectId,
+      name: args.name,
+      createdBy: args.createdBy,
+      sourceSessionId: args.sourceSessionId,
+    }),
+    projectId,
+  );
+}
+
+export async function renameWorkspaceSession(projectId: string, workspaceSessionId: string, name: string) {
+  const nextName = name.trim();
+  if (!nextName) {
+    throw new Error("Session name is required");
+  }
+
+  if (!isTauriRuntime()) {
+    const session = requireWorkspaceSession(projectId, workspaceSessionId);
+    session.name = nextName;
+    return { ...session };
+  }
+
+  return normalizeWorkspaceSession(
+    await invoke("rename_workspace_session", { projectId, workspaceSessionId, name: nextName }),
+    projectId,
+  );
+}
+
+export async function deleteWorkspaceSession(projectId: string, workspaceSessionId: string) {
+  if (!isTauriRuntime()) {
+    const projectSnapshot = getMockProjectSnapshot(projectId);
+    projectSnapshot.sessions = projectSnapshot.sessions.filter((entry) => entry.id !== workspaceSessionId);
+    mockState.sessionSnapshots.delete(workspaceSessionId);
+    if (!projectSnapshot.sessions.length) {
+      const fallback = createMockWorkspaceSession(projectId, "main", "user", null);
+      projectSnapshot.sessions = [fallback];
+      mockState.sessionSnapshots.set(fallback.id, createEmptySessionSnapshot(projectId, fallback.id));
     }
-    return cloneSnapshot(snapshot);
+    return cloneProjectSnapshot(projectSnapshot);
   }
 
-  const snapshot = await invoke<unknown>("open_workspace", { projectId });
-  return normalizeWorkspaceSnapshot(snapshot, projectId);
+  return normalizeProjectWorkspaceSnapshot(
+    await invoke("delete_workspace_session", { projectId, workspaceSessionId }),
+    projectId,
+  );
 }
 
-export async function createTab(projectId: string, title?: string) {
+export async function createWindow(projectId: string, workspaceSessionId: string, title?: string) {
   if (!isTauriRuntime()) {
-    const snapshot = getMockWorkspace(projectId);
-    const tab = createMockTab(title ?? `tab-${snapshot.tabs.length + 1}`);
-    snapshot.tabs.push(tab);
-    snapshot.activeTabId = tab.id;
-    return cloneSnapshot(snapshot);
+    const snapshot = getMockSessionSnapshot(projectId, workspaceSessionId);
+    const tab = createMockTab(title ?? `window-${snapshot.windows.length + 1}`);
+    snapshot.windows.push(tab);
+    snapshot.activeWindowId = tab.id;
+    return cloneSessionSnapshot(snapshot);
   }
 
-  const snapshot = await invoke<unknown>("create_tab", { projectId, title });
-  return normalizeWorkspaceSnapshot(snapshot, projectId);
+  return normalizeSessionWorkspaceSnapshot(
+    await invoke("create_window", { projectId, workspaceSessionId, title }),
+    projectId,
+    workspaceSessionId,
+  );
 }
 
-export async function closeTab(projectId: string, tabId: string) {
+export async function closeWindow(projectId: string, workspaceSessionId: string, windowId: string) {
   if (!isTauriRuntime()) {
-    const snapshot = getMockWorkspace(projectId);
-    const index = snapshot.tabs.findIndex((tab) => tab.id === tabId);
+    const snapshot = getMockSessionSnapshot(projectId, workspaceSessionId);
+    const index = snapshot.windows.findIndex((entry) => entry.id === windowId);
     if (index < 0) {
-      throw new Error("Tab not found");
+      throw new Error("Window not found");
     }
-
-    const removed = snapshot.tabs.splice(index, 1)[0];
+    const removed = snapshot.windows.splice(index, 1)[0];
     const removedSessionIds = collectSessionIds(removed.root);
-    snapshot.sessions = snapshot.sessions.filter((session) => !removedSessionIds.includes(session.id));
-
-    if (!snapshot.tabs.length) {
-      const tab = createMockTab("main");
-      snapshot.tabs = [tab];
-      snapshot.activeTabId = tab.id;
-    } else if (snapshot.activeTabId === tabId) {
-      snapshot.activeTabId = snapshot.tabs[Math.max(0, index - 1)]?.id ?? snapshot.tabs[0].id;
-    }
-
-    return cloneSnapshot(snapshot);
+    snapshot.terminals = snapshot.terminals.filter((entry) => !removedSessionIds.includes(entry.id));
+    snapshot.activeWindowId = snapshot.windows[Math.max(0, index - 1)]?.id ?? snapshot.windows[0]?.id ?? null;
+    return cloneSessionSnapshot(snapshot);
   }
 
-  const snapshot = await invoke<unknown>("close_tab", { projectId, tabId });
-  return normalizeWorkspaceSnapshot(snapshot, projectId);
+  return normalizeSessionWorkspaceSnapshot(
+    await invoke("close_window", { projectId, workspaceSessionId, windowId }),
+    projectId,
+    workspaceSessionId,
+  );
 }
 
-export async function renameTab(projectId: string, tabId: string, title: string) {
+export async function renameWindow(projectId: string, workspaceSessionId: string, windowId: string, title: string) {
   if (!isTauriRuntime()) {
-    const snapshot = getMockWorkspace(projectId);
-    const tab = snapshot.tabs.find((entry) => entry.id === tabId);
-    if (!tab) {
-      throw new Error("Tab not found");
-    }
-    tab.title = title;
-    return cloneSnapshot(snapshot);
+    requireWindow(getMockSessionSnapshot(projectId, workspaceSessionId), windowId).title = title;
+    return cloneSessionSnapshot(getMockSessionSnapshot(projectId, workspaceSessionId));
   }
 
-  const snapshot = await invoke<unknown>("rename_tab", { projectId, tabId, title });
-  return normalizeWorkspaceSnapshot(snapshot, projectId);
+  return normalizeSessionWorkspaceSnapshot(
+    await invoke("rename_window", { projectId, workspaceSessionId, windowId, title }),
+    projectId,
+    workspaceSessionId,
+  );
 }
 
-export async function setActiveTab(projectId: string, tabId: string) {
+export async function setActiveWindow(projectId: string, workspaceSessionId: string, windowId: string) {
   if (!isTauriRuntime()) {
-    const snapshot = getMockWorkspace(projectId);
-    snapshot.activeTabId = tabId;
-    return cloneSnapshot(snapshot);
+    const snapshot = getMockSessionSnapshot(projectId, workspaceSessionId);
+    snapshot.activeWindowId = windowId;
+    return cloneSessionSnapshot(snapshot);
   }
 
-  const snapshot = await invoke<unknown>("set_active_tab", { projectId, tabId });
-  return normalizeWorkspaceSnapshot(snapshot, projectId);
+  return normalizeSessionWorkspaceSnapshot(
+    await invoke("set_active_window", { projectId, workspaceSessionId, windowId }),
+    projectId,
+    workspaceSessionId,
+  );
 }
 
-export async function splitPane(projectId: string, tabId: string, stackId: string, direction: SplitDirection) {
+export async function splitPane(
+  projectId: string,
+  workspaceSessionId: string,
+  windowId: string,
+  stackId: string,
+  direction: SplitDirection,
+) {
   if (!isTauriRuntime()) {
-    const snapshot = getMockWorkspace(projectId);
-    const tab = requireTab(snapshot, tabId);
-    if (!splitMockStack(tab, stackId, direction)) {
-      throw new Error("Target stack not found");
+    const snapshot = getMockSessionSnapshot(projectId, workspaceSessionId);
+    const window = requireWindow(snapshot, windowId);
+    if (!splitMockStack(window, stackId, direction)) {
+      throw new Error("Target pane not found");
     }
-    return cloneSnapshot(snapshot);
+    return cloneSessionSnapshot(snapshot);
   }
 
-  const snapshot = await invoke<unknown>("split_pane", { projectId, tabId, stackId, direction });
-  return normalizeWorkspaceSnapshot(snapshot, projectId);
+  return normalizeSessionWorkspaceSnapshot(
+    await invoke("split_pane", { projectId, workspaceSessionId, tabId: windowId, stackId, direction }),
+    projectId,
+    workspaceSessionId,
+  );
 }
 
 export async function createSession(args: CreateSessionArgs) {
   if (!isTauriRuntime()) {
-    const snapshot = getMockWorkspace(args.projectId);
-    const tab = requireTab(snapshot, args.tabId);
+    const snapshot = getMockSessionSnapshot(args.projectId, args.workspaceSessionId);
+    const window = args.windowId ? requireWindow(snapshot, args.windowId) : ensureMockWindow(snapshot);
+    const stackId = args.stackId ?? window.activePaneId ?? getFirstStackId(window.root);
+    if (!stackId) {
+      throw new Error("Target pane not found");
+    }
+
     const session: TerminalSession = {
-      id: nextId("session"),
+      id: nextId("terminal-session"),
       projectId: args.projectId,
+      workspaceSessionId: args.workspaceSessionId,
+      windowId: window.id,
       title: args.title ?? args.program ?? "Terminal",
       program: args.program ?? "powershell",
       args: args.args ?? null,
       launchProfile: args.launchProfile ?? "terminal",
       tmuxShimEnabled: (args.launchProfile ?? "terminal") !== "terminal",
-      cwd: args.cwd ?? mockState.projects.find((project) => project.id === args.projectId)?.path ?? "D:\\",
+      cwd: args.cwd ?? requireProject(args.projectId).path,
       status: "running",
-      startedAt: Date.now().toString(),
+      startedAt: now(),
       endedAt: null,
       exitCode: null,
     };
 
-    attachSessionToMockStack(tab.root, args.stackId, session.id, session.title);
-    tab.activePaneId = args.stackId;
-    snapshot.sessions = [session, ...snapshot.sessions.filter((entry) => entry.id !== session.id)];
-    return cloneSnapshot(snapshot);
+    attachSessionToStack(window.root, stackId, session.id, session.title);
+    window.activePaneId = stackId;
+    snapshot.activeWindowId = window.id;
+    snapshot.terminals = [session, ...snapshot.terminals.filter((entry) => entry.id !== session.id)];
+    return cloneSessionSnapshot(snapshot);
   }
 
-  console.debug("[launcher] create_session start", {
-    projectId: args.projectId,
-    tabId: args.tabId,
-    stackId: args.stackId,
-    program: args.program,
-    args: args.args,
-  });
-  const snapshot = await invoke<unknown>("create_session", {
-    projectId: args.projectId,
-    tabId: args.tabId,
-    stackId: args.stackId,
-    title: args.title,
-    program: args.program,
-    args: args.args,
-    cwd: args.cwd,
-    launchProfile: args.launchProfile,
-  });
-  console.debug("[launcher] create_session end", {
-    projectId: args.projectId,
-    stackId: args.stackId,
-  });
-  return normalizeWorkspaceSnapshot(snapshot, args.projectId);
+  return normalizeSessionWorkspaceSnapshot(
+    await invoke("create_session", {
+      projectId: args.projectId,
+      workspaceSessionId: args.workspaceSessionId,
+      windowId: args.windowId,
+      stackId: args.stackId,
+      title: args.title,
+      program: args.program,
+      args: args.args,
+      cwd: args.cwd,
+      launchProfile: args.launchProfile,
+    }),
+    args.projectId,
+    args.workspaceSessionId,
+  );
 }
 
-export async function setActiveStackItem(projectId: string, tabId: string, stackId: string, itemId: string) {
+export async function setActiveStackItem(
+  projectId: string,
+  workspaceSessionId: string,
+  windowId: string,
+  stackId: string,
+  itemId: string,
+) {
   if (!isTauriRuntime()) {
-    const snapshot = getMockWorkspace(projectId);
-    const tab = requireTab(snapshot, tabId);
-    setMockActiveStackItem(tab.root, stackId, itemId);
-    return cloneSnapshot(snapshot);
+    const window = requireWindow(getMockSessionSnapshot(projectId, workspaceSessionId), windowId);
+    setMockActiveStackItem(window.root, stackId, itemId);
+    return cloneSessionSnapshot(getMockSessionSnapshot(projectId, workspaceSessionId));
   }
 
-  const snapshot = await invoke<unknown>("set_active_stack_item_command", { projectId, tabId, stackId, itemId });
-  return normalizeWorkspaceSnapshot(snapshot, projectId);
+  return normalizeSessionWorkspaceSnapshot(
+    await invoke("set_active_stack_item_command", { projectId, workspaceSessionId, tabId: windowId, stackId, itemId }),
+    projectId,
+    workspaceSessionId,
+  );
 }
 
-export async function closePane(projectId: string, tabId: string, stackId: string) {
+export async function closePane(projectId: string, workspaceSessionId: string, windowId: string, stackId: string) {
   if (!isTauriRuntime()) {
-    const snapshot = getMockWorkspace(projectId);
-    const tab = requireTab(snapshot, tabId);
-    const sessionIds = closeMockPane(tab.root, stackId);
+    const snapshot = getMockSessionSnapshot(projectId, workspaceSessionId);
+    const window = requireWindow(snapshot, windowId);
+    const sessionIds = closeMockPane(window.root, stackId);
     if (!sessionIds) {
       throw new Error("Pane not found");
     }
-    if (!tab.activePaneId || tab.activePaneId === stackId) {
-      tab.activePaneId = getFirstStackId(tab.root);
-    }
-    snapshot.sessions = snapshot.sessions.filter((session) => !sessionIds.includes(session.id));
-    return cloneSnapshot(snapshot);
+    window.activePaneId = getFirstStackId(window.root);
+    snapshot.terminals = snapshot.terminals.filter((entry) => !sessionIds.includes(entry.id));
+    return cloneSessionSnapshot(snapshot);
   }
 
-  const snapshot = await invoke<unknown>("close_pane", { projectId, tabId, stackId });
-  return normalizeWorkspaceSnapshot(snapshot, projectId);
+  return normalizeSessionWorkspaceSnapshot(
+    await invoke("close_pane", { projectId, workspaceSessionId, tabId: windowId, stackId }),
+    projectId,
+    workspaceSessionId,
+  );
 }
 
 export async function writeSessionInput(sessionId: string, input: string) {
@@ -305,7 +393,10 @@ export async function resizeSession(sessionId: string, cols: number, rows: numbe
 
 export async function reportTabViewport(projectId: string, tabId: string, width: number, height: number) {
   if (!isTauriRuntime()) {
-    mockState.tabViewports.set(tabViewportKey(projectId, tabId), { width, height });
+    void projectId;
+    void tabId;
+    void width;
+    void height;
     return;
   }
 
@@ -322,129 +413,76 @@ export async function readClipboardPayload(): Promise<PastePayload> {
     }
   }
 
-  const payload = await invoke<unknown>("read_clipboard_payload");
-  return normalizePastePayload(payload);
+  return normalizePastePayload(await invoke("read_clipboard_payload"));
 }
 
-function createMockState() {
-  const projectA: Project = {
-    id: "project-app",
+function createMockState(): MockState {
+  const project: Project = {
+    id: "project-demo",
     name: "Workspace Terminal",
     path: "D:\\FutureTeam\\00002.VantaraC",
     color: "#0ea5e9",
     icon: null,
-    lastOpenedAt: Date.now().toString(),
-    createdAt: Date.now().toString(),
+    lastOpenedAt: now(),
+    createdAt: now(),
   };
-  const projectB: Project = {
-    id: "project-api",
-    name: "Backend Services",
-    path: "D:\\FutureTeam\\backend-services",
-    color: "#34d399",
-    icon: null,
-    lastOpenedAt: (Date.now() - 1000).toString(),
-    createdAt: (Date.now() - 1000).toString(),
-  };
-
-  const appTab = createMockTab("main");
-
-  const backendTab = createMockTab("api");
-  splitMockStack(backendTab, getFirstStackId(backendTab.root)!, "vertical", "user");
-  let backendStackIds = collectStackIds(backendTab.root);
-  splitMockStack(backendTab, backendStackIds[1], "horizontal", "ai");
-  backendStackIds = collectStackIds(backendTab.root);
-  const backendSessions: TerminalSession[] = [
-    {
-      id: "session-api-1",
-      projectId: projectB.id,
-      title: "server",
-      program: "powershell",
-      args: null,
-      launchProfile: "terminal",
-      tmuxShimEnabled: false,
-      cwd: projectB.path,
-      status: "running",
-      startedAt: Date.now().toString(),
-      endedAt: null,
-      exitCode: null,
-    },
-    {
-      id: "session-api-2",
-      projectId: projectB.id,
-      title: "tests",
-      program: "powershell",
-      args: null,
-      launchProfile: "terminal",
-      tmuxShimEnabled: false,
-      cwd: projectB.path,
-      status: "running",
-      startedAt: Date.now().toString(),
-      endedAt: null,
-      exitCode: null,
-    },
-    {
-      id: "session-api-3",
-      projectId: projectB.id,
-      title: "review-agent",
-      program: "codex",
-      args: ["--full-auto"],
-      launchProfile: "codexFullAuto",
-      tmuxShimEnabled: true,
-      cwd: projectB.path,
-      status: "running",
-      startedAt: Date.now().toString(),
-      endedAt: null,
-      exitCode: null,
-    },
-  ];
-  attachSessionToMockStack(backendTab.root, backendStackIds[0], backendSessions[0].id, backendSessions[0].title);
-  attachSessionToMockStack(backendTab.root, backendStackIds[1], backendSessions[1].id, backendSessions[1].title);
-  attachSessionToMockStack(backendTab.root, backendStackIds[2], backendSessions[2].id, backendSessions[2].title);
-
+  const session = createMockWorkspaceSession(project.id, "main", "user", null);
   return {
-    projects: [projectA, projectB],
-    workspaces: new Map<string, WorkspaceSnapshot>([
-      [
-        projectA.id,
-        {
-          projectId: projectA.id,
-          activeTabId: appTab.id,
-          tabs: [appTab],
-          sessions: [],
-        },
-      ],
-      [
-        projectB.id,
-        {
-          projectId: projectB.id,
-          activeTabId: backendTab.id,
-          tabs: [backendTab],
-          sessions: backendSessions,
-        },
-      ],
-    ]),
-    tabViewports: new Map<string, TabViewport>(),
-    counter: 1,
+    counter: 0,
+    projects: [project],
+    projectSnapshots: new Map([[project.id, { projectId: project.id, sessions: [session] }]]),
+    sessionSnapshots: new Map([[session.id, createEmptySessionSnapshot(project.id, session.id)]]),
   };
 }
 
-function cloneSnapshot(snapshot: WorkspaceSnapshot): WorkspaceSnapshot {
+function now() {
+  return Date.now().toString();
+}
+
+function nextId(prefix: string) {
+  mockState.counter += 1;
+  return `${prefix}-${mockState.counter}`;
+}
+
+function cloneProjectSnapshot(snapshot: ProjectWorkspaceSnapshot) {
+  return JSON.parse(JSON.stringify(snapshot)) as ProjectWorkspaceSnapshot;
+}
+
+function cloneSessionSnapshot(snapshot: WorkspaceSnapshot) {
   return JSON.parse(JSON.stringify(snapshot)) as WorkspaceSnapshot;
 }
 
-function getMockWorkspace(projectId: string) {
-  const snapshot = mockState.workspaces.get(projectId);
-  if (!snapshot) {
-    throw new Error("Workspace not found");
-  }
-  return snapshot;
+function createMockWorkspaceSession(
+  projectId: string,
+  name: string,
+  createdBy: WorkspaceSessionCreatedBy,
+  sourceSessionId: string | null,
+): WorkspaceSession {
+  return {
+    id: nextId("workspace-session"),
+    projectId,
+    name,
+    createdBy,
+    sourceSessionId,
+    lastOpenedAt: now(),
+    createdAt: now(),
+  };
+}
+
+function createEmptySessionSnapshot(projectId: string, workspaceSessionId: string): WorkspaceSnapshot {
+  return {
+    projectId,
+    sessionId: workspaceSessionId,
+    activeWindowId: null,
+    windows: [],
+    terminals: [],
+  };
 }
 
 function createMockTab(title: string): WorkspaceTab {
   const root = createEmptyStack(1, "user", null);
-
   return {
-    id: nextId("tab"),
+    id: nextId("window"),
     title,
     root,
     nextPaneOrdinal: 2,
@@ -454,8 +492,8 @@ function createMockTab(title: string): WorkspaceTab {
 
 function createEmptyStack(
   paneOrdinal: number,
-  createdBy: "user" | "ai" = "user",
-  sourcePaneId: string | null = null,
+  createdBy: "user" | "ai",
+  sourcePaneId: string | null,
   launchState?: PaneLaunchState,
 ): LayoutNode {
   const itemId = nextId("item");
@@ -468,20 +506,66 @@ function createEmptyStack(
     launchState: launchState ?? (createdBy === "ai" ? "launched" : "unlaunched"),
     sourcePaneId,
     activeItemId: itemId,
-    items: [
-      {
-        id: itemId,
-        kind: "terminal",
-        sessionId: null,
-        title: "Empty",
-      },
-    ],
+    items: [{ id: itemId, kind: "terminal", sessionId: null, title: "Empty" }],
   };
 }
 
-function nextId(prefix: string) {
-  mockCounter += 1;
-  return `${prefix}-${mockCounter}`;
+function requireProject(projectId: string) {
+  const project = mockState.projects.find((entry) => entry.id === projectId);
+  if (!project) {
+    throw new Error("Project not found");
+  }
+  return project;
+}
+
+function getMockProjectSnapshot(projectId: string) {
+  const snapshot = mockState.projectSnapshots.get(projectId);
+  if (!snapshot) {
+    throw new Error("Project not found");
+  }
+  return snapshot;
+}
+
+function requireWorkspaceSession(projectId: string, workspaceSessionId: string) {
+  const session = getMockProjectSnapshot(projectId).sessions.find((entry) => entry.id === workspaceSessionId);
+  if (!session) {
+    throw new Error("Session not found");
+  }
+  return session;
+}
+
+function touchMockSession(projectId: string, workspaceSessionId: string) {
+  const session = requireWorkspaceSession(projectId, workspaceSessionId);
+  session.lastOpenedAt = now();
+}
+
+function getMockSessionSnapshot(projectId: string, workspaceSessionId: string) {
+  requireWorkspaceSession(projectId, workspaceSessionId);
+  let snapshot = mockState.sessionSnapshots.get(workspaceSessionId);
+  if (!snapshot) {
+    snapshot = createEmptySessionSnapshot(projectId, workspaceSessionId);
+    mockState.sessionSnapshots.set(workspaceSessionId, snapshot);
+  }
+  return snapshot;
+}
+
+function requireWindow(snapshot: WorkspaceSnapshot, windowId: string) {
+  const window = snapshot.windows.find((entry) => entry.id === windowId);
+  if (!window) {
+    throw new Error("Window not found");
+  }
+  return window;
+}
+
+function ensureMockWindow(snapshot: WorkspaceSnapshot) {
+  const existing = snapshot.activeWindowId ? snapshot.windows.find((entry) => entry.id === snapshot.activeWindowId) : null;
+  if (existing) {
+    return existing;
+  }
+  const window = createMockTab("main");
+  snapshot.windows.push(window);
+  snapshot.activeWindowId = window.id;
+  return window;
 }
 
 function normalizeProject(value: unknown): Project {
@@ -490,18 +574,10 @@ function normalizeProject(value: unknown): Project {
     id: asString(record.id, nextId("project")),
     name: asString(record.name, "Project"),
     path: asString(record.path, "D:\\"),
-    color: asString(record.color, mockColors[0]),
+    color: asString(record.color, "#0ea5e9"),
     icon: typeof record.icon === "string" ? record.icon : null,
-    lastOpenedAt: typeof record.lastOpenedAt === "string"
-      ? record.lastOpenedAt
-      : typeof record.last_opened_at === "string"
-        ? record.last_opened_at
-        : null,
-    createdAt: typeof record.createdAt === "string"
-      ? record.createdAt
-      : typeof record.created_at === "string"
-        ? record.created_at
-        : Date.now().toString(),
+    lastOpenedAt: normalizeNullableString(record.lastOpenedAt ?? record.last_opened_at),
+    createdAt: asString(record.createdAt ?? record.created_at, now()),
   };
 }
 
@@ -513,93 +589,99 @@ function normalizeDeleteProjectResult(value: unknown): DeleteProjectResult {
   };
 }
 
-function normalizeWorkspaceSnapshot(value: unknown, fallbackProjectId?: string): WorkspaceSnapshot {
+function normalizeProjectWorkspaceSnapshot(value: unknown, fallbackProjectId: string): ProjectWorkspaceSnapshot {
   const record = asRecord(value);
-  const projectId = asString(record.projectId ?? record.project_id, fallbackProjectId ?? nextId("project"));
-  const sessions = Array.isArray(record.sessions) ? record.sessions.map((entry) => normalizeSession(entry, projectId)) : [];
-  const tabsSource = Array.isArray(record.tabs) ? record.tabs : [];
-  const tabs = tabsSource.length > 0
-    ? tabsSource.map((entry, index) => normalizeTab(entry, index + 1))
-    : [createMockTab("main")];
-  const activeTabId = asString(record.activeTabId ?? record.active_tab_id, tabs[0]?.id ?? null);
-
   return {
-    projectId,
-    activeTabId: tabs.some((tab) => tab.id === activeTabId) ? activeTabId : tabs[0]?.id ?? null,
-    tabs,
-    sessions,
+    projectId: asString(record.projectId ?? record.project_id, fallbackProjectId),
+    sessions: Array.isArray(record.sessions)
+      ? record.sessions.map((entry) => normalizeWorkspaceSession(entry, fallbackProjectId))
+      : [],
   };
 }
 
-function normalizeTab(value: unknown, fallbackOrdinal: number) {
+function normalizeWorkspaceSession(value: unknown, fallbackProjectId: string): WorkspaceSession {
   const record = asRecord(value);
-  const title = asString(record.title, fallbackOrdinal === 1 ? "main" : `tab-${fallbackOrdinal}`);
-  const fallback = createMockTab(title);
-  const root = normalizeLayoutNode(record.root, 1, "user", "unlaunched", null);
+  return {
+    id: asString(record.id, nextId("workspace-session")),
+    projectId: asString(record.projectId ?? record.project_id, fallbackProjectId),
+    name: asString(record.name, "session"),
+    createdBy: record.createdBy === "ai" || record.created_by === "ai" ? "ai" : "user",
+    sourceSessionId: normalizeNullableString(record.sourceSessionId ?? record.source_session_id),
+    lastOpenedAt: normalizeNullableString(record.lastOpenedAt ?? record.last_opened_at),
+    createdAt: asString(record.createdAt ?? record.created_at, now()),
+  };
+}
 
+function normalizeSessionWorkspaceSnapshot(
+  value: unknown,
+  fallbackProjectId: string,
+  fallbackWorkspaceSessionId: string,
+): WorkspaceSnapshot {
+  const record = asRecord(value);
+  const projectId = asString(record.projectId ?? record.project_id, fallbackProjectId);
+  const sessionId = asString(record.sessionId ?? record.session_id, fallbackWorkspaceSessionId);
+  const rawWindows = record.windows ?? record.tabs;
+  const windowsSource: unknown[] = Array.isArray(rawWindows) ? rawWindows : [];
+  const windows = windowsSource.map((entry: unknown, index: number) => normalizeWindow(entry, index + 1));
+  const rawTerminals = record.terminals ?? record.sessions;
+  const terminalsSource: unknown[] = Array.isArray(rawTerminals)
+    ? rawTerminals
+    : [];
+  return {
+    projectId,
+    sessionId,
+    activeWindowId: asString(record.activeWindowId ?? record.activeTabId ?? record.active_tab_id, windows[0]?.id ?? null),
+    windows,
+    terminals: terminalsSource.map((entry: unknown) => normalizeTerminalSession(entry, projectId, sessionId)),
+  };
+}
+
+function normalizeWindow(value: unknown, fallbackOrdinal: number): WorkspaceTab {
+  const record = asRecord(value);
+  const fallback = createMockTab(fallbackOrdinal === 1 ? "main" : `window-${fallbackOrdinal}`);
   return {
     id: asString(record.id, fallback.id),
-    title,
-    root,
-    nextPaneOrdinal: asNumber(record.nextPaneOrdinal ?? record.next_pane_ordinal, Math.max(countStacks(root) + 1, 2)),
-    activePaneId: asString(record.activePaneId ?? record.active_pane_id, getFirstStackId(root)),
+    title: asString(record.title, fallback.title),
+    root: normalizeLayoutNode(record.root, 1, "user", "unlaunched", null),
+    nextPaneOrdinal: asNumber(record.nextPaneOrdinal ?? record.next_pane_ordinal, fallback.nextPaneOrdinal),
+    activePaneId: asString(record.activePaneId ?? record.active_pane_id, fallback.activePaneId ?? null),
   };
 }
 
 function normalizeLayoutNode(
   value: unknown,
   fallbackOrdinal: number,
-  fallbackOwner: PaneOwner,
+  fallbackOwner: "user" | "ai",
   fallbackLaunchState: PaneLaunchState,
   fallbackSourcePaneId: string | null,
 ): LayoutNode {
   const record = asRecord(value);
-  const type = asString(record.type, "stack");
-  if (type === "split") {
-    const direction = asString(record.direction, "horizontal") === "vertical" ? "vertical" : "horizontal";
-    const zoneKind = normalizeSplitZoneKind(record.zoneKind ?? record.zone_kind);
-    const childValues = Array.isArray(record.children) ? record.children : [];
-    const children = childValues.length > 0
-      ? childValues.map((child, index) => normalizeLayoutNode(child, fallbackOrdinal + index, fallbackOwner, fallbackLaunchState, fallbackSourcePaneId))
+  if (record.type === "split") {
+    const children = Array.isArray(record.children)
+      ? record.children.map((child, index) =>
+        normalizeLayoutNode(child, fallbackOrdinal + index, fallbackOwner, fallbackLaunchState, fallbackSourcePaneId))
       : [createEmptyStack(fallbackOrdinal, fallbackOwner, fallbackSourcePaneId, fallbackLaunchState)];
-    const defaultSizes = children.length === 2
-      ? defaultSplitSizes(direction)
-      : children.map((_child, index) => (index === 0 ? 100 - ((children.length - 1) * Math.floor(100 / children.length)) : Math.floor(100 / children.length)));
-    const sizes = Array.isArray(record.sizes) && record.sizes.length === children.length
-      ? record.sizes.map((entry, index) => asNumber(entry, defaultSizes[index] ?? 50))
-      : defaultSizes;
-
     return {
       type: "split",
       id: asString(record.id, nextId("split")),
-      direction,
-      zoneKind,
-      sizes,
+      direction: record.direction === "vertical" ? "vertical" : "horizontal",
+      zoneKind: record.zoneKind === "aiWorkspace" || record.zone_kind === "aiWorkspace" ? "aiWorkspace" : "default",
+      sizes: Array.isArray(record.sizes) ? record.sizes.map((entry) => asNumber(entry, 50)) : [50, 50],
       children,
     };
   }
 
-  const createdBy = normalizePaneOwner(record.createdBy ?? record.created_by, fallbackOwner);
-  const paneOrdinal = asNumber(record.paneOrdinal ?? record.pane_ordinal, fallbackOrdinal);
-  const paneLabel = asString(record.paneLabel ?? record.pane_label, `P${paneOrdinal}`);
-  const launchState = normalizeLaunchState(record.launchState ?? record.launch_state, createdBy === "ai" ? "launched" : fallbackLaunchState);
   const itemsSource = Array.isArray(record.items) ? record.items : [];
   const items = itemsSource.length > 0 ? itemsSource.map(normalizeStackItem) : [emptyStackItem()];
-  const activeItemId = asString(record.activeItemId ?? record.active_item_id, items[0]?.id ?? nextId("item"));
-
   return {
     type: "stack",
     id: asString(record.id, nextId("stack")),
-    paneOrdinal,
-    paneLabel,
-    createdBy,
-    launchState,
-    sourcePaneId: typeof record.sourcePaneId === "string"
-      ? record.sourcePaneId
-      : typeof record.source_pane_id === "string"
-        ? record.source_pane_id
-        : fallbackSourcePaneId,
-    activeItemId: items.some((item) => item.id === activeItemId) ? activeItemId : items[0].id,
+    paneOrdinal: asNumber(record.paneOrdinal ?? record.pane_ordinal, fallbackOrdinal),
+    paneLabel: asString(record.paneLabel ?? record.pane_label, `P${fallbackOrdinal}`),
+    createdBy: record.createdBy === "ai" || record.created_by === "ai" ? "ai" : fallbackOwner,
+    launchState: record.launchState === "launched" || record.launch_state === "launched" ? "launched" : fallbackLaunchState,
+    sourcePaneId: normalizeNullableString(record.sourcePaneId ?? record.source_pane_id) ?? fallbackSourcePaneId,
+    activeItemId: asString(record.activeItemId ?? record.active_item_id, items[0].id),
     items,
   };
 }
@@ -609,34 +691,32 @@ function normalizeStackItem(value: unknown): StackItem {
   return {
     id: asString(record.id, nextId("item")),
     kind: "terminal",
-    sessionId: typeof record.sessionId === "string"
-      ? record.sessionId
-      : typeof record.session_id === "string"
-        ? record.session_id
-        : null,
+    sessionId: normalizeNullableString(record.sessionId ?? record.session_id),
     title: asString(record.title, "Terminal"),
   };
 }
 
-function normalizeSession(value: unknown, fallbackProjectId: string): TerminalSession {
+function normalizeTerminalSession(
+  value: unknown,
+  fallbackProjectId: string,
+  fallbackWorkspaceSessionId: string,
+): TerminalSession {
   const record = asRecord(value);
   return {
-    id: asString(record.id, nextId("session")),
+    id: asString(record.id, nextId("terminal-session")),
     projectId: asString(record.projectId ?? record.project_id, fallbackProjectId),
+    workspaceSessionId: asString(record.workspaceSessionId ?? record.workspace_session_id, fallbackWorkspaceSessionId),
+    windowId: asString(record.windowId ?? record.window_id, ""),
     title: asString(record.title, "Terminal"),
     program: asString(record.program ?? record.shell, "powershell"),
-    args: normalizeArgs(record.args ?? record.args_json),
+    args: Array.isArray(record.args) ? record.args.filter((entry): entry is string => typeof entry === "string") : null,
     launchProfile: normalizeLaunchProfile(record.launchProfile ?? record.launch_profile),
     tmuxShimEnabled: Boolean(record.tmuxShimEnabled ?? record.tmux_shim_enabled),
     cwd: asString(record.cwd, "D:\\"),
     status: normalizeSessionStatus(record.status),
     startedAt: normalizeNullableString(record.startedAt ?? record.started_at),
     endedAt: normalizeNullableString(record.endedAt ?? record.ended_at),
-    exitCode: typeof record.exitCode === "number"
-      ? record.exitCode
-      : typeof record.exit_code === "number"
-        ? record.exit_code
-        : null,
+    exitCode: typeof record.exitCode === "number" ? record.exitCode : typeof record.exit_code === "number" ? record.exit_code : null,
   };
 }
 
@@ -645,183 +725,58 @@ function normalizeSessionStatus(value: unknown): TerminalSession["status"] {
 }
 
 function normalizeLaunchProfile(value: unknown): LaunchProfile {
-  return value === "claude"
-    || value === "claudeUnsafe"
-    || value === "codex"
-    || value === "codexFullAuto"
-    || value === "terminal"
+  return value === "claude" || value === "claudeUnsafe" || value === "codex" || value === "codexFullAuto" || value === "terminal"
     ? value
     : "terminal";
-}
-
-function normalizeArgs(value: unknown): string[] | null {
-  if (Array.isArray(value)) {
-    return value.filter((entry): entry is string => typeof entry === "string");
-  }
-  if (typeof value === "string") {
-    try {
-      const parsed = JSON.parse(value);
-      return Array.isArray(parsed) ? parsed.filter((entry): entry is string => typeof entry === "string") : null;
-    } catch {
-      return null;
-    }
-  }
-  return null;
-}
-
-function normalizePaneOwner(value: unknown, fallback: PaneOwner): PaneOwner {
-  return value === "ai" || value === "user" ? value : fallback;
-}
-
-function normalizeLaunchState(value: unknown, fallback: PaneLaunchState): PaneLaunchState {
-  return value === "launched" || value === "unlaunched" ? value : fallback;
-}
-
-function normalizeSplitZoneKind(value: unknown): SplitZoneKind {
-  return value === "aiWorkspace" ? "aiWorkspace" : "default";
-}
-
-function normalizeNullableString(value: unknown): string | null {
-  return typeof value === "string" ? value : null;
 }
 
 function normalizePastePayload(value: unknown): PastePayload {
   const record = asRecord(value);
   if (record.kind === "files" && Array.isArray(record.paths)) {
-    return {
-      kind: "files",
-      paths: record.paths.filter((entry): entry is string => typeof entry === "string"),
-    };
+    return { kind: "files", paths: record.paths.filter((entry): entry is string => typeof entry === "string") };
   }
-
   if (record.kind === "imagePath" && typeof record.imagePath === "string") {
-    return {
-      kind: "imagePath",
-      imagePath: record.imagePath,
-    };
+    return { kind: "imagePath", imagePath: record.imagePath };
   }
-
   if (record.kind === "text" && typeof record.text === "string") {
-    return {
-      kind: "text",
-      text: record.text,
-    };
+    return { kind: "text", text: record.text };
   }
-
   return { kind: "empty" };
 }
 
-function asRecord(value: unknown): Record<string, unknown> {
-  return value && typeof value === "object" ? (value as Record<string, unknown>) : {};
+function splitMockStack(tab: WorkspaceTab, targetId: string, direction: SplitDirection): boolean {
+  return splitMockNode(tab.root, tab, targetId, direction);
 }
 
-function asString(value: unknown, fallback: string | null): string {
-  if (typeof value === "string" && value.trim().length > 0) {
-    return value;
-  }
-  return fallback ?? "";
-}
-
-function asNumber(value: unknown, fallback: number): number {
-  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
-}
-
-function emptyStackItem(): StackItem {
-  return {
-    id: nextId("item"),
-    kind: "terminal",
-    sessionId: null,
-    title: "Empty",
-  };
-}
-
-function countStacks(node: LayoutNode): number {
-  if (node.type === "stack") {
-    return 1;
-  }
-  return node.children.reduce((sum, child) => sum + countStacks(child), 0);
-}
-
-function requireTab(snapshot: WorkspaceSnapshot, tabId: string) {
-  const tab = snapshot.tabs.find((entry) => entry.id === tabId);
-  if (!tab) {
-    throw new Error("Tab not found");
-  }
-  return tab;
-}
-
-function splitMockStack(
-  tab: WorkspaceTab,
-  targetId: string,
-  direction: SplitDirection,
-  createdBy: PaneOwner = "user",
-): boolean {
-  return splitMockNode(tab.root, tab, targetId, direction, createdBy);
-}
-
-function splitMockNode(
-  node: LayoutNode,
-  tab: WorkspaceTab,
-  targetId: string,
-  direction: SplitDirection,
-  createdBy: PaneOwner,
-): boolean {
+function splitMockNode(node: LayoutNode, tab: WorkspaceTab, targetId: string, direction: SplitDirection): boolean {
   if (node.type === "stack" && node.id === targetId) {
     const current = JSON.parse(JSON.stringify(node)) as LayoutNode;
-    const replacement: LayoutNode = {
+    Object.keys(node).forEach((key) => delete (node as Record<string, unknown>)[key]);
+    Object.assign(node, {
       type: "split",
       id: nextId("split"),
       direction,
       zoneKind: "default",
-      sizes: defaultSplitSizes(direction),
-      children: [current, createEmptyStack(tab.nextPaneOrdinal, createdBy, node.id)],
-    };
+      sizes: [50, 50],
+      children: [current, createEmptyStack(tab.nextPaneOrdinal, "user", targetId)],
+    } satisfies LayoutNode);
     tab.nextPaneOrdinal += 1;
-    replaceNode(node, replacement);
     return true;
   }
 
-  if (node.type === "split") {
-    return node.children.some((child) => splitMockNode(child, tab, targetId, direction, createdBy));
-  }
-
-  return false;
+  return node.type === "split" && node.children.some((child) => splitMockNode(child, tab, targetId, direction));
 }
 
-function attachSessionToMockStack(node: LayoutNode, targetId: string, sessionId: string, title: string): boolean {
+function attachSessionToStack(node: LayoutNode, targetId: string, sessionId: string, title: string): boolean {
   if (node.type === "stack" && node.id === targetId) {
-    const first = node.items[0];
-    if (node.items.length <= 1) {
-      node.items = [
-        {
-          id: first?.id ?? nextId("item"),
-          kind: "terminal",
-          sessionId,
-          title,
-        },
-      ];
-      node.launchState = "launched";
-      node.activeItemId = node.items[0].id;
-      return true;
-    }
-
-    const item = {
-      id: nextId("item"),
-      kind: "terminal" as const,
-      sessionId,
-      title,
-    };
-    node.items.push(item);
+    const itemId = node.items[0]?.id ?? nextId("item");
+    node.items = [{ id: itemId, kind: "terminal", sessionId, title }];
+    node.activeItemId = itemId;
     node.launchState = "launched";
-    node.activeItemId = item.id;
     return true;
   }
 
-  if (node.type === "split") {
-    return node.children.some((child) => attachSessionToMockStack(child, targetId, sessionId, title));
-  }
-
-  return false;
+  return node.type === "split" && node.children.some((child) => attachSessionToStack(child, targetId, sessionId, title));
 }
 
 function setMockActiveStackItem(node: LayoutNode, targetId: string, itemId: string): boolean {
@@ -829,130 +784,71 @@ function setMockActiveStackItem(node: LayoutNode, targetId: string, itemId: stri
     node.activeItemId = itemId;
     return true;
   }
-
-  if (node.type === "split") {
-    return node.children.some((child) => setMockActiveStackItem(child, targetId, itemId));
-  }
-
-  return false;
+  return node.type === "split" && node.children.some((child) => setMockActiveStackItem(child, targetId, itemId));
 }
 
 function closeMockPane(node: LayoutNode, targetId: string): string[] | null {
   if (node.type === "stack" && node.id === targetId) {
-    const sessionIds = collectSessionIds(node);
-    clearMockStack(node);
-    return sessionIds;
+    return collectSessionIds(node);
   }
-
   if (node.type !== "split") {
     return null;
   }
-
   for (let index = 0; index < node.children.length; index += 1) {
     const child = node.children[index];
-
     if (child.type === "stack" && child.id === targetId) {
       const sessionIds = collectSessionIds(child);
       node.children.splice(index, 1);
       if (node.children.length === 1) {
-        replaceNode(node, node.children[0]);
-      } else {
-        node.sizes = defaultSizesForCount(node.direction, node.children.length);
+        const replacement = node.children[0];
+        Object.keys(node).forEach((key) => delete (node as Record<string, unknown>)[key]);
+        Object.assign(node, replacement);
       }
       return sessionIds;
     }
-
     const nested = closeMockPane(child, targetId);
     if (nested) {
-      if (node.type === "split" && node.children.length === 1) {
-        replaceNode(node, node.children[0]);
-      } else if (node.type === "split") {
-        node.sizes = defaultSizesForCount(node.direction, node.children.length);
-      }
       return nested;
     }
   }
-
   return null;
 }
 
-function clearMockStack(node: Extract<LayoutNode, { type: "stack" }>) {
-  const itemId = nextId("item");
-  node.activeItemId = itemId;
-  node.launchState = node.createdBy === "user" ? "unlaunched" : "launched";
-  node.items = [
-    {
-      id: itemId,
-      kind: "terminal",
-      sessionId: null,
-      title: "Empty",
-    },
-  ];
-}
-
 function collectSessionIds(node: LayoutNode): string[] {
-  if (node.type === "stack") {
-    return node.items.flatMap((item) => (item.sessionId ? [item.sessionId] : []));
-  }
-
-  return node.children.flatMap((child) => collectSessionIds(child));
-}
-
-function replaceNode(target: LayoutNode, replacement: LayoutNode) {
-  for (const key of Object.keys(target)) {
-    delete (target as Record<string, unknown>)[key];
-  }
-  Object.assign(target, replacement);
-}
-
-function defaultSizesForCount(direction: SplitDirection, childCount: number): number[] {
-  if (childCount <= 0) {
-    return [];
-  }
-
-  if (childCount === 1) {
-    return [100];
-  }
-
-  if (childCount === 2) {
-    return defaultSplitSizes(direction);
-  }
-
-  const base = Math.floor(100 / childCount);
-  const remainder = 100 - base * childCount;
-  return Array.from({ length: childCount }, (_, index) => (index === 0 ? base + remainder : base));
+  return node.type === "stack"
+    ? node.items.flatMap((item) => (item.sessionId ? [item.sessionId] : []))
+    : node.children.flatMap((child) => collectSessionIds(child));
 }
 
 function getFirstStackId(node: LayoutNode): string | null {
   if (node.type === "stack") {
     return node.id;
   }
-
   for (const child of node.children) {
     const id = getFirstStackId(child);
     if (id) {
       return id;
     }
   }
-
   return null;
 }
 
-function collectStackIds(node: LayoutNode): string[] {
-  if (node.type === "stack") {
-    return [node.id];
-  }
-
-  return node.children.flatMap((child) => collectStackIds(child));
+function asRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" ? (value as Record<string, unknown>) : {};
 }
 
-function defaultSplitSizes(direction: SplitDirection): [number, number] {
-  void direction;
-  return [50, 50];
+function asString(value: unknown, fallback: string | null): string {
+  return typeof value === "string" && value.trim().length > 0 ? value : (fallback ?? "");
 }
 
-function tabViewportKey(projectId: string, tabId: string) {
-  return `${projectId}:${tabId}`;
+function asNumber(value: unknown, fallback: number): number {
+  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
 }
 
-const mockColors = ["#0ea5e9", "#34d399", "#f97316", "#facc15"];
+function normalizeNullableString(value: unknown): string | null {
+  return typeof value === "string" ? value : null;
+}
+
+function emptyStackItem(): StackItem {
+  return { id: nextId("item"), kind: "terminal", sessionId: null, title: "Empty" };
+}

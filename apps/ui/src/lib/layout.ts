@@ -1,4 +1,4 @@
-import type { LayoutNode, WorkspaceTab } from "@workspace-terminal/contracts";
+import type { LayoutNode, WorkspaceTab } from "../../../../packages/contracts/src/index.ts";
 
 export function getActiveTab(tabs: WorkspaceTab[], activeTabId?: string | null) {
   return tabs.find((tab) => tab.id === activeTabId) ?? tabs[0] ?? null;

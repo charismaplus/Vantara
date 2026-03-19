@@ -15,10 +15,13 @@ export type DeleteProjectResult = {
 
 export type SessionStatus = "starting" | "running" | "exited" | "failed";
 export type LaunchProfile = "terminal" | "claude" | "claudeUnsafe" | "codex" | "codexFullAuto";
+export type WorkspaceSessionCreatedBy = "user" | "ai";
 
 export type TerminalSession = {
   id: string;
   projectId: string;
+  workspaceSessionId: string;
+  windowId: string;
   title: string;
   program: string;
   args?: string[] | null;
@@ -65,7 +68,7 @@ export type SplitNode = {
 
 export type LayoutNode = StackNode | SplitNode;
 
-export type WorkspaceTab = {
+export type WorkspaceWindow = {
   id: string;
   title: string;
   root: LayoutNode;
@@ -73,11 +76,27 @@ export type WorkspaceTab = {
   activePaneId?: string | null;
 };
 
-export type WorkspaceSnapshot = {
+export type WorkspaceSession = {
+  id: string;
   projectId: string;
-  activeTabId?: string | null;
-  tabs: WorkspaceTab[];
-  sessions: TerminalSession[];
+  name: string;
+  createdBy: WorkspaceSessionCreatedBy;
+  sourceSessionId?: string | null;
+  lastOpenedAt?: string | null;
+  createdAt: string;
+};
+
+export type ProjectWorkspaceSnapshot = {
+  projectId: string;
+  sessions: WorkspaceSession[];
+};
+
+export type SessionWorkspaceSnapshot = {
+  projectId: string;
+  sessionId: string;
+  activeWindowId?: string | null;
+  windows: WorkspaceWindow[];
+  terminals: TerminalSession[];
 };
 
 export type SessionOutputEvent = {
@@ -87,7 +106,11 @@ export type SessionOutputEvent = {
 
 export type WorkspaceChangedEvent = {
   projectId: string;
+  sessionId?: string | null;
 };
+
+export type WorkspaceTab = WorkspaceWindow;
+export type WorkspaceSnapshot = SessionWorkspaceSnapshot;
 
 export type PastePayload =
   | {

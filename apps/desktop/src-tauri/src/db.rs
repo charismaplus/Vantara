@@ -3,11 +3,9 @@ use std::{fs, path::PathBuf};
 use rusqlite::{Connection, params};
 use uuid::Uuid;
 
-use crate::{
-    layout::{new_workspace_tab, normalize_tab, reset_tab_layout},
-    models::{
-        LaunchProfile, Project, SessionStatus, TerminalSession, WorkspaceSnapshot, WorkspaceTab,
-    },
+use crate::models::{
+    LaunchProfile, Project, SessionStatus, TerminalSession, WorkspaceSession,
+    WorkspaceSessionCreatedBy,
 };
 
 pub struct Database {
@@ -32,15 +30,21 @@ impl Database {
               created_at TEXT NOT NULL
             );
 
-            CREATE TABLE IF NOT EXISTS workspaces (
-              project_id TEXT PRIMARY KEY,
-              active_tab_id TEXT,
-              tabs_json TEXT NOT NULL
+            CREATE TABLE IF NOT EXISTS workspace_sessions (
+              id TEXT PRIMARY KEY,
+              project_id TEXT NOT NULL,
+              name TEXT NOT NULL,
+              created_by TEXT NOT NULL DEFAULT 'user',
+              source_session_id TEXT,
+              last_opened_at TEXT,
+              created_at TEXT NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS sessions (
               id TEXT PRIMARY KEY,
               project_id TEXT NOT NULL,
+              workspace_session_id TEXT,
+              window_id TEXT,
               title TEXT NOT NULL,
               shell TEXT NOT NULL,
               program TEXT,
@@ -62,6 +66,20 @@ impl Database {
         let _ = conn.execute("ALTER TABLE sessions ADD COLUMN launch_profile TEXT", []);
         let _ = conn.execute(
             "ALTER TABLE sessions ADD COLUMN tmux_shim_enabled INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+        let _ = conn.execute("ALTER TABLE sessions ADD COLUMN workspace_session_id TEXT", []);
+        let _ = conn.execute("ALTER TABLE sessions ADD COLUMN window_id TEXT", []);
+        let _ = conn.execute(
+            "ALTER TABLE workspace_sessions ADD COLUMN created_by TEXT NOT NULL DEFAULT 'user'",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE workspace_sessions ADD COLUMN source_session_id TEXT",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE workspace_sessions ADD COLUMN last_opened_at TEXT",
             [],
         );
 
@@ -107,16 +125,12 @@ impl Database {
             )
             .map_err(|err| err.to_string())?;
 
-        let default_tab = new_workspace_tab("main".to_string());
-        let active_tab_id = default_tab.id.clone();
-
-        let tabs = serde_json::to_string(&vec![default_tab]).map_err(|err| err.to_string())?;
-        self.conn
-            .execute(
-                "INSERT INTO workspaces (project_id, active_tab_id, tabs_json) VALUES (?1, ?2, ?3)",
-                params![id, active_tab_id, tabs],
-            )
-            .map_err(|err| err.to_string())?;
+        self.create_workspace_session(
+            &id,
+            Some("main".to_string()),
+            WorkspaceSessionCreatedBy::User,
+            None,
+        )?;
 
         self.get_project(&id)?
             .ok_or_else(|| "Failed to reload project".to_string())
@@ -180,7 +194,7 @@ impl Database {
         )
         .map_err(|err| err.to_string())?;
         tx.execute(
-            "DELETE FROM workspaces WHERE project_id = ?1",
+            "DELETE FROM workspace_sessions WHERE project_id = ?1",
             params![project_id],
         )
         .map_err(|err| err.to_string())?;
@@ -189,127 +203,244 @@ impl Database {
         tx.commit().map_err(|err| err.to_string())
     }
 
-    pub fn load_workspace(&self, project_id: &str) -> Result<WorkspaceSnapshot, String> {
-        let mut stmt = self
+    pub fn ensure_default_workspace_session(&self, project_id: &str) -> Result<(), String> {
+        let count: i64 = self
             .conn
-            .prepare("SELECT active_tab_id, tabs_json FROM workspaces WHERE project_id = ?1")
-            .map_err(|err| err.to_string())?;
-
-        let (active_tab_id, tabs_json): (Option<String>, String) = stmt
-            .query_row(params![project_id], |row| Ok((row.get(0)?, row.get(1)?)))
-            .map_err(|err| err.to_string())?;
-
-        let mut tabs: Vec<WorkspaceTab> =
-            serde_json::from_str(&tabs_json).map_err(|err| err.to_string())?;
-        let mut normalized = false;
-
-        for tab in tabs.iter_mut() {
-            normalized |= normalize_tab(tab);
-        }
-
-        let active_tab_id = match active_tab_id {
-            Some(ref tab_id) if tabs.iter().any(|tab| tab.id == *tab_id) => Some(tab_id.clone()),
-            _ => tabs.first().map(|tab| tab.id.clone()),
-        };
-
-        if normalized {
-            let normalized_snapshot = WorkspaceSnapshot {
-                project_id: project_id.to_string(),
-                active_tab_id: active_tab_id.clone(),
-                tabs: tabs.clone(),
-                sessions: self.list_sessions(project_id)?,
-            };
-            self.save_workspace(&normalized_snapshot)?;
-        }
-        let sessions = self.list_sessions(project_id)?;
-
-        Ok(WorkspaceSnapshot {
-            project_id: project_id.to_string(),
-            active_tab_id,
-            tabs,
-            sessions,
-        })
-    }
-
-    pub fn save_workspace(&self, snapshot: &WorkspaceSnapshot) -> Result<(), String> {
-        let tabs_json = serde_json::to_string(&snapshot.tabs).map_err(|err| err.to_string())?;
-        self.conn
-            .execute(
-                "UPDATE workspaces SET active_tab_id = ?1, tabs_json = ?2 WHERE project_id = ?3",
-                params![snapshot.active_tab_id, tabs_json, snapshot.project_id],
+            .query_row(
+                "SELECT COUNT(*) FROM workspace_sessions WHERE project_id = ?1",
+                params![project_id],
+                |row| row.get(0),
             )
             .map_err(|err| err.to_string())?;
+
+        if count == 0 {
+            self.create_workspace_session(
+                project_id,
+                Some("main".to_string()),
+                WorkspaceSessionCreatedBy::User,
+                None,
+            )?;
+        }
+
         Ok(())
     }
 
-    pub fn save_workspace_outline(&self, snapshot: &WorkspaceSnapshot) -> Result<(), String> {
-        let mut tabs = snapshot.tabs.clone();
-        if tabs.is_empty() {
-            tabs.push(new_workspace_tab("main".to_string()));
-        } else {
-            for tab in tabs.iter_mut() {
-                reset_tab_layout(tab);
-            }
-        }
-
-        let active_tab_id = match &snapshot.active_tab_id {
-            Some(tab_id) if tabs.iter().any(|tab| tab.id == *tab_id) => Some(tab_id.clone()),
-            _ => tabs.first().map(|tab| tab.id.clone()),
-        };
-
-        let tabs_json = serde_json::to_string(&tabs).map_err(|err| err.to_string())?;
-        self.conn
-            .execute(
-                "UPDATE workspaces SET active_tab_id = ?1, tabs_json = ?2 WHERE project_id = ?3",
-                params![active_tab_id, tabs_json, snapshot.project_id],
-            )
-            .map_err(|err| err.to_string())?;
-        Ok(())
-    }
-
-    pub fn list_sessions(&self, project_id: &str) -> Result<Vec<TerminalSession>, String> {
+    pub fn list_workspace_sessions(
+        &self,
+        project_id: &str,
+    ) -> Result<Vec<WorkspaceSession>, String> {
+        self.ensure_default_workspace_session(project_id)?;
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT id, project_id, title, COALESCE(program, shell), args_json, launch_profile, tmux_shim_enabled, cwd, status, started_at, ended_at, exit_code
-                 FROM sessions WHERE project_id = ?1 ORDER BY COALESCE(started_at, ended_at) DESC",
+                "SELECT id, project_id, name, created_by, source_session_id, last_opened_at, created_at
+                 FROM workspace_sessions
+                 WHERE project_id = ?1
+                 ORDER BY COALESCE(last_opened_at, created_at) DESC, created_at ASC",
             )
             .map_err(|err| err.to_string())?;
 
         let rows = stmt
             .query_map(params![project_id], |row| {
-                let args_json: Option<String> = row.get(4)?;
-                let launch_profile_str: Option<String> = row.get(5)?;
-                let tmux_shim_enabled: i64 = row.get(6)?;
-                let status_str: String = row.get(8)?;
+                Ok(WorkspaceSession {
+                    id: row.get(0)?,
+                    project_id: row.get(1)?,
+                    name: row.get(2)?,
+                    created_by: parse_workspace_session_created_by(row.get::<_, String>(3)?),
+                    source_session_id: row.get(4)?,
+                    last_opened_at: row.get(5)?,
+                    created_at: row.get(6)?,
+                })
+            })
+            .map_err(|err| err.to_string())?;
+
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|err| err.to_string())
+    }
+
+    pub fn get_workspace_session(
+        &self,
+        project_id: &str,
+        workspace_session_id: &str,
+    ) -> Result<Option<WorkspaceSession>, String> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, project_id, name, created_by, source_session_id, last_opened_at, created_at
+                 FROM workspace_sessions
+                 WHERE project_id = ?1 AND id = ?2",
+            )
+            .map_err(|err| err.to_string())?;
+
+        let result = stmt.query_row(params![project_id, workspace_session_id], |row| {
+            Ok(WorkspaceSession {
+                id: row.get(0)?,
+                project_id: row.get(1)?,
+                name: row.get(2)?,
+                created_by: parse_workspace_session_created_by(row.get::<_, String>(3)?),
+                source_session_id: row.get(4)?,
+                last_opened_at: row.get(5)?,
+                created_at: row.get(6)?,
+            })
+        });
+
+        match result {
+            Ok(session) => Ok(Some(session)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(err) => Err(err.to_string()),
+        }
+    }
+
+    pub fn create_workspace_session(
+        &self,
+        project_id: &str,
+        name: Option<String>,
+        created_by: WorkspaceSessionCreatedBy,
+        source_session_id: Option<String>,
+    ) -> Result<WorkspaceSession, String> {
+        let id = Uuid::new_v4().to_string();
+        let created_at = now_iso();
+        let session_name = name
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| self.next_workspace_session_name(project_id));
+
+        self.conn
+            .execute(
+                "INSERT INTO workspace_sessions (id, project_id, name, created_by, source_session_id, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    id,
+                    project_id,
+                    session_name,
+                    workspace_session_created_by_to_str(&created_by),
+                    source_session_id,
+                    created_at
+                ],
+            )
+            .map_err(|err| err.to_string())?;
+
+        self.get_workspace_session(project_id, &id)?
+            .ok_or_else(|| "Workspace session not found".to_string())
+    }
+
+    pub fn rename_workspace_session(
+        &self,
+        project_id: &str,
+        workspace_session_id: &str,
+        name: &str,
+    ) -> Result<WorkspaceSession, String> {
+        self.conn
+            .execute(
+                "UPDATE workspace_sessions SET name = ?1 WHERE project_id = ?2 AND id = ?3",
+                params![name, project_id, workspace_session_id],
+            )
+            .map_err(|err| err.to_string())?;
+
+        self.get_workspace_session(project_id, workspace_session_id)?
+            .ok_or_else(|| "Workspace session not found".to_string())
+    }
+
+    pub fn touch_workspace_session(
+        &self,
+        project_id: &str,
+        workspace_session_id: &str,
+    ) -> Result<(), String> {
+        self.conn
+            .execute(
+                "UPDATE workspace_sessions SET last_opened_at = ?1 WHERE project_id = ?2 AND id = ?3",
+                params![now_iso(), project_id, workspace_session_id],
+            )
+            .map_err(|err| err.to_string())?;
+        Ok(())
+    }
+
+    pub fn delete_workspace_session(
+        &mut self,
+        project_id: &str,
+        workspace_session_id: &str,
+    ) -> Result<(), String> {
+        let tx = self.conn.transaction().map_err(|err| err.to_string())?;
+        tx.execute(
+            "DELETE FROM sessions WHERE project_id = ?1 AND workspace_session_id = ?2",
+            params![project_id, workspace_session_id],
+        )
+        .map_err(|err| err.to_string())?;
+        tx.execute(
+            "DELETE FROM workspace_sessions WHERE project_id = ?1 AND id = ?2",
+            params![project_id, workspace_session_id],
+        )
+        .map_err(|err| err.to_string())?;
+        tx.commit().map_err(|err| err.to_string())?;
+        self.ensure_default_workspace_session(project_id)?;
+        Ok(())
+    }
+
+    pub fn list_sessions(&self, project_id: &str) -> Result<Vec<TerminalSession>, String> {
+        self.list_sessions_for_project(project_id)
+    }
+
+    pub fn list_sessions_for_project(&self, project_id: &str) -> Result<Vec<TerminalSession>, String> {
+        self.list_sessions_query(
+            "SELECT id, project_id, workspace_session_id, window_id, title, COALESCE(program, shell), args_json, launch_profile, tmux_shim_enabled, cwd, status, started_at, ended_at, exit_code
+             FROM sessions WHERE project_id = ?1 ORDER BY COALESCE(started_at, ended_at) DESC",
+            params![project_id],
+        )
+    }
+
+    pub fn list_sessions_for_workspace_session(
+        &self,
+        workspace_session_id: &str,
+    ) -> Result<Vec<TerminalSession>, String> {
+        self.list_sessions_query(
+            "SELECT id, project_id, workspace_session_id, window_id, title, COALESCE(program, shell), args_json, launch_profile, tmux_shim_enabled, cwd, status, started_at, ended_at, exit_code
+             FROM sessions WHERE workspace_session_id = ?1 ORDER BY COALESCE(started_at, ended_at) DESC",
+            params![workspace_session_id],
+        )
+    }
+
+    fn list_sessions_query<P>(&self, sql: &str, params: P) -> Result<Vec<TerminalSession>, String>
+    where
+        P: rusqlite::Params,
+    {
+        let mut stmt = self.conn.prepare(sql).map_err(|err| err.to_string())?;
+
+        let rows = stmt
+            .query_map(params, |row| {
+                let args_json: Option<String> = row.get(6)?;
+                let launch_profile_str: Option<String> = row.get(7)?;
+                let tmux_shim_enabled: i64 = row.get(8)?;
+                let status_str: String = row.get(10)?;
                 Ok(TerminalSession {
                     id: row.get(0)?,
                     project_id: row.get(1)?,
-                    title: row.get(2)?,
-                    program: row.get(3)?,
+                    workspace_session_id: row.get(2)?,
+                    window_id: row.get(3)?,
+                    title: row.get(4)?,
+                    program: row.get(5)?,
                     args: args_json
                         .as_deref()
                         .map(serde_json::from_str)
                         .transpose()
                         .map_err(|err| {
                             rusqlite::Error::FromSqlConversionFailure(
-                                4,
+                                6,
                                 rusqlite::types::Type::Text,
                                 Box::new(err),
                             )
                         })?,
                     launch_profile: parse_launch_profile(launch_profile_str.as_deref()),
                     tmux_shim_enabled: tmux_shim_enabled != 0,
-                    cwd: row.get(7)?,
+                    cwd: row.get(9)?,
                     status: match status_str.as_str() {
                         "running" => SessionStatus::Running,
                         "exited" => SessionStatus::Exited,
                         "failed" => SessionStatus::Failed,
                         _ => SessionStatus::Starting,
                     },
-                    started_at: row.get(9)?,
-                    ended_at: row.get(10)?,
-                    exit_code: row.get(11)?,
+                    started_at: row.get(11)?,
+                    ended_at: row.get(12)?,
+                    exit_code: row.get(13)?,
                 })
             })
             .map_err(|err| err.to_string())?;
@@ -329,9 +460,11 @@ impl Database {
         self.conn
             .execute(
                 r#"
-                INSERT INTO sessions (id, project_id, title, shell, program, args_json, launch_profile, tmux_shim_enabled, cwd, status, started_at, ended_at, exit_code)
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                INSERT INTO sessions (id, project_id, workspace_session_id, window_id, title, shell, program, args_json, launch_profile, tmux_shim_enabled, cwd, status, started_at, ended_at, exit_code)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
                 ON CONFLICT(id) DO UPDATE SET
+                  workspace_session_id = excluded.workspace_session_id,
+                  window_id = excluded.window_id,
                   title = excluded.title,
                   shell = excluded.shell,
                   program = excluded.program,
@@ -347,6 +480,8 @@ impl Database {
                 params![
                     session.id,
                     session.project_id,
+                    session.workspace_session_id,
+                    session.window_id,
                     session.title,
                     session.program,
                     session.program,
@@ -390,6 +525,19 @@ impl Database {
             .map_err(|err| err.to_string())?;
         Ok(())
     }
+
+    fn next_workspace_session_name(&self, project_id: &str) -> String {
+        let count: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM workspace_sessions WHERE project_id = ?1",
+                params![project_id],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+
+        format!("session-{}", count + 1)
+    }
 }
 
 pub fn now_iso() -> String {
@@ -428,5 +576,19 @@ fn parse_launch_profile(raw: Option<&str>) -> LaunchProfile {
         "codex" => LaunchProfile::Codex,
         "codexFullAuto" => LaunchProfile::CodexFullAuto,
         _ => LaunchProfile::Terminal,
+    }
+}
+
+fn workspace_session_created_by_to_str(created_by: &WorkspaceSessionCreatedBy) -> &'static str {
+    match created_by {
+        WorkspaceSessionCreatedBy::User => "user",
+        WorkspaceSessionCreatedBy::Ai => "ai",
+    }
+}
+
+fn parse_workspace_session_created_by(raw: String) -> WorkspaceSessionCreatedBy {
+    match raw.as_str() {
+        "ai" => WorkspaceSessionCreatedBy::Ai,
+        _ => WorkspaceSessionCreatedBy::User,
     }
 }

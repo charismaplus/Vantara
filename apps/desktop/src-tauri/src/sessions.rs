@@ -4,7 +4,7 @@ use std::{
     collections::HashMap,
     io::{Read, Write},
     path::Path,
-    process::Command,
+    process::{Child as ProcessChild, ChildStdin, Command, Stdio},
     sync::{Arc, Mutex},
     thread,
     time::{Duration, Instant},
@@ -22,7 +22,7 @@ const TMUX_SHELL_READY_PHASE1_TIMEOUT: Duration = Duration::from_millis(1_500);
 const TMUX_SHELL_READY_PHASE2_TIMEOUT: Duration = Duration::from_millis(2_000);
 const TMUX_SHELL_READY_POLL: Duration = Duration::from_millis(25);
 const TMUX_SHELL_READY_SETTLE: Duration = Duration::from_millis(100);
-const OUTPUT_TAIL_CHAR_LIMIT: usize = 2_048;
+const OUTPUT_TAIL_CHAR_LIMIT: usize = 32_768;
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
@@ -46,6 +46,31 @@ pub struct SessionCreateOptions {
     pub shell_kind: SessionShellKind,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SessionCaptureOptions {
+    pub include_escape: bool,
+    pub join_lines: bool,
+    pub start_line: Option<i32>,
+    pub end_line: Option<i32>,
+}
+
+#[derive(Default)]
+pub struct SessionPipeOptions {
+    pub program: Option<String>,
+    pub args: Option<Vec<String>>,
+    pub cwd: Option<String>,
+    pub env: Option<HashMap<String, String>>,
+    pub pipe_output: bool,
+    pub pipe_input: bool,
+    pub only_if_none: bool,
+}
+
+struct SessionPipeRuntime {
+    child: ProcessChild,
+    stdin: Option<ChildStdin>,
+    pipe_output: bool,
+}
+
 struct SessionRuntime {
     master: Box<dyn portable_pty::MasterPty + Send>,
     writer: Box<dyn Write + Send>,
@@ -56,6 +81,7 @@ struct SessionRuntime {
     started_at: Instant,
     last_output_at: Instant,
     output_tail: String,
+    pipe: Option<SessionPipeRuntime>,
 }
 
 #[derive(Clone, Default)]
@@ -131,6 +157,7 @@ impl SessionManager {
                     started_at: now,
                     last_output_at: now,
                     output_tail: String::new(),
+                    pipe: None,
                 },
             );
 
@@ -147,6 +174,14 @@ impl SessionManager {
                             if let Some(runtime) = runtimes.get_mut(&reader_session_id) {
                                 runtime.last_output_at = Instant::now();
                                 push_output_tail(&mut runtime.output_tail, &chunk);
+                                if let Some(pipe) = runtime.pipe.as_mut() {
+                                    if pipe.pipe_output {
+                                        if let Some(stdin) = pipe.stdin.as_mut() {
+                                            let _ = stdin.write_all(chunk.as_bytes());
+                                            let _ = stdin.flush();
+                                        }
+                                    }
+                                }
                             }
                         }
                         let _ = reader_app.emit(
@@ -238,6 +273,88 @@ impl SessionManager {
         let session_id = session_id.to_string();
         thread::spawn(move || {
             let _ = terminate_runtime(&session_id, runtime);
+        });
+        Ok(())
+    }
+
+    pub fn configure_pipe(&self, session_id: &str, options: SessionPipeOptions) -> Result<(), String> {
+        let mut runtimes = self
+            .runtimes
+            .lock()
+            .map_err(|_| "Session lock poisoned".to_string())?;
+        let runtime = runtimes
+            .get_mut(session_id)
+            .ok_or_else(|| "Session not found".to_string())?;
+
+        if options.only_if_none && runtime.pipe.is_some() {
+            return Ok(());
+        }
+
+        if let Some(mut existing_pipe) = runtime.pipe.take() {
+            let _ = existing_pipe.child.kill();
+            let _ = existing_pipe.child.wait();
+        }
+
+        let Some(program) = options.program else {
+            return Ok(());
+        };
+
+        let mut command = Command::new(program);
+        if let Some(args) = options.args {
+            command.args(args);
+        }
+        if let Some(cwd) = options.cwd {
+            command.current_dir(cwd);
+        }
+        if let Some(env) = options.env {
+            command.envs(env);
+        }
+        if options.pipe_output {
+            command.stdin(Stdio::piped());
+        }
+        if options.pipe_input {
+            command.stdout(Stdio::piped());
+        }
+        #[cfg(windows)]
+        {
+            command.creation_flags(CREATE_NO_WINDOW);
+        }
+
+        let mut child = command.spawn().map_err(|err| err.to_string())?;
+        let child_stdin = child.stdin.take();
+
+        if options.pipe_input {
+            if let Some(mut stdout) = child.stdout.take() {
+                let runtimes = self.runtimes.clone();
+                let session_id = session_id.to_string();
+                thread::spawn(move || {
+                    let mut buffer = [0_u8; 4096];
+                    loop {
+                        match stdout.read(&mut buffer) {
+                            Ok(0) => break,
+                            Ok(read) => {
+                                if let Ok(mut runtimes) = runtimes.lock() {
+                                    if let Some(runtime) = runtimes.get_mut(&session_id) {
+                                        let _ = runtime.writer.write_all(&buffer[..read]);
+                                        let _ = runtime.writer.flush();
+                                    } else {
+                                        break;
+                                    }
+                                } else {
+                                    break;
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                });
+            }
+        }
+
+        runtime.pipe = Some(SessionPipeRuntime {
+            child,
+            stdin: child_stdin,
+            pipe_output: options.pipe_output,
         });
         Ok(())
     }
@@ -340,6 +457,41 @@ impl SessionManager {
             runtime.shell_ready = true;
         }
         Ok(())
+    }
+
+    pub fn capture_output(
+        &self,
+        session_id: &str,
+        options: SessionCaptureOptions,
+    ) -> Result<String, String> {
+        let runtimes = self
+            .runtimes
+            .lock()
+            .map_err(|_| "Session lock poisoned".to_string())?;
+        let runtime = runtimes
+            .get(session_id)
+            .ok_or_else(|| "Session not found".to_string())?;
+
+        let mut output = runtime.output_tail.clone();
+        if !options.include_escape {
+            output = strip_ansi(&output);
+        }
+
+        let mut lines = output.lines().map(str::to_string).collect::<Vec<_>>();
+        let start_index = resolve_capture_line_index(lines.len(), options.start_line, 0);
+        let end_index = resolve_capture_line_index(
+            lines.len(),
+            options.end_line,
+            lines.len().saturating_sub(1) as i32,
+        );
+        if !lines.is_empty() && start_index <= end_index {
+            lines = lines[start_index..=end_index].to_vec();
+        } else if options.start_line.is_some() || options.end_line.is_some() {
+            lines.clear();
+        }
+
+        let separator = if options.join_lines { "" } else { "\n" };
+        Ok(lines.join(separator))
     }
 }
 
@@ -481,6 +633,20 @@ fn push_output_tail(output_tail: &mut String, chunk: &str) {
     }
 }
 
+fn resolve_capture_line_index(total_lines: usize, raw_index: Option<i32>, default_index: i32) -> usize {
+    if total_lines == 0 {
+        return 0;
+    }
+
+    let index = raw_index.unwrap_or(default_index);
+    let normalized = if index < 0 {
+        total_lines as i32 + index
+    } else {
+        index
+    };
+    normalized.clamp(0, total_lines.saturating_sub(1) as i32) as usize
+}
+
 fn looks_like_git_bash_prompt(output_tail: &str) -> bool {
     let clean = strip_ansi(output_tail);
     let line = clean
@@ -516,6 +682,12 @@ fn strip_ansi(input: &str) -> String {
 }
 
 fn terminate_runtime(session_id: &str, mut runtime: SessionRuntime) -> Result<(), String> {
+    if let Some(mut pipe) = runtime.pipe.take() {
+        let _ = pipe.stdin.take();
+        let _ = pipe.child.kill();
+        let _ = pipe.child.wait();
+    }
+
     let kill_error = runtime.killer.kill().err().map(|err| err.to_string());
 
     #[cfg(windows)]

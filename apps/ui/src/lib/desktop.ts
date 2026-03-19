@@ -1,4 +1,4 @@
-import type { SessionOutputEvent, WorkspaceChangedEvent } from "@workspace-terminal/contracts";
+import type { SessionOutputEvent, WorkspaceChangedEvent } from "../../../../packages/contracts/src/index.ts";
 
 import { isTauriRuntime } from "./runtime";
 

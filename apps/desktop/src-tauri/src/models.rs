@@ -30,6 +30,14 @@ pub struct DeleteProjectResult {
     pub next_project_id: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum WorkspaceSessionCreatedBy {
+    #[default]
+    User,
+    Ai,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SessionStatus {
@@ -44,6 +52,8 @@ pub enum SessionStatus {
 pub struct TerminalSession {
     pub id: String,
     pub project_id: String,
+    pub workspace_session_id: String,
+    pub window_id: String,
     pub title: String,
     pub program: String,
     #[serde(default)]
@@ -124,7 +134,7 @@ pub enum LayoutNode {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct WorkspaceTab {
+pub struct WorkspaceWindow {
     pub id: String,
     pub title: String,
     pub root: LayoutNode,
@@ -136,10 +146,35 @@ pub struct WorkspaceTab {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct WorkspaceSnapshot {
+pub struct WorkspaceSession {
+    pub id: String,
     pub project_id: String,
+    pub name: String,
+    #[serde(default)]
+    pub created_by: WorkspaceSessionCreatedBy,
+    #[serde(default)]
+    pub source_session_id: Option<String>,
+    pub last_opened_at: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectWorkspaceSnapshot {
+    pub project_id: String,
+    pub sessions: Vec<WorkspaceSession>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionWorkspaceSnapshot {
+    pub project_id: String,
+    pub session_id: String,
+    #[serde(rename = "activeWindowId")]
     pub active_tab_id: Option<String>,
-    pub tabs: Vec<WorkspaceTab>,
+    #[serde(rename = "windows")]
+    pub tabs: Vec<WorkspaceWindow>,
+    #[serde(rename = "terminals")]
     pub sessions: Vec<TerminalSession>,
 }
 
@@ -154,6 +189,7 @@ pub struct SessionOutputEvent {
 #[serde(rename_all = "camelCase")]
 pub struct WorkspaceChangedEvent {
     pub project_id: String,
+    pub session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -162,3 +198,6 @@ pub struct SessionExitEvent {
     pub session_id: String,
     pub exit_code: Option<i32>,
 }
+
+pub type WorkspaceTab = WorkspaceWindow;
+pub type WorkspaceSnapshot = SessionWorkspaceSnapshot;

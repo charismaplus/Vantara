@@ -6,6 +6,12 @@ use crate::models::{
     LayoutNode, PaneCreatedBy, PaneLaunchState, SplitZoneKind, StackItem, WorkspaceTab,
 };
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SplitInsertion {
+    Before,
+    After,
+}
+
 pub enum CloseSessionResult {
     NotFound,
     Updated,
@@ -132,31 +138,94 @@ pub fn split_stack_node(
     }
 }
 
-pub fn wrap_root_with_ai_workspace(
+pub fn split_stack_node_with_options(
+    node: &mut LayoutNode,
+    target_id: &str,
+    direction: &str,
+    next_pane_ordinal: &mut u32,
+    created_by: PaneCreatedBy,
+    source_pane_id: Option<String>,
+    insertion: SplitInsertion,
+    new_child_size: Option<u16>,
+) -> Option<String> {
+    match node {
+        LayoutNode::Stack { id, .. } if id == target_id => {
+            let source_pane_id = source_pane_id.unwrap_or_else(|| id.clone());
+            let current = node.clone();
+            let new_child = new_stack_node(
+                allocate_pane_ordinal(next_pane_ordinal),
+                created_by,
+                Some(source_pane_id),
+            );
+            let new_child_id = match &new_child {
+                LayoutNode::Stack { id, .. } => id.clone(),
+                LayoutNode::Split { .. } => unreachable!("new_stack_node must create a stack"),
+            };
+
+            let (children, sizes) =
+                split_children_with_sizes(current, new_child, insertion, new_child_size, direction);
+
+            *node = LayoutNode::Split {
+                id: Uuid::new_v4().to_string(),
+                direction: direction.to_string(),
+                zone_kind: SplitZoneKind::Default,
+                sizes,
+                children,
+            };
+            Some(new_child_id)
+        }
+        LayoutNode::Split { children, .. } => {
+            for child in children.iter_mut() {
+                if let Some(new_child_id) = split_stack_node_with_options(
+                    child,
+                    target_id,
+                    direction,
+                    next_pane_ordinal,
+                    created_by.clone(),
+                    source_pane_id.clone(),
+                    insertion,
+                    new_child_size,
+                ) {
+                    return Some(new_child_id);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+pub fn wrap_root_with_split(
     tab: &mut WorkspaceTab,
     direction: &str,
+    created_by: PaneCreatedBy,
     source_pane_id: Option<String>,
+    insertion: SplitInsertion,
+    new_child_size: Option<u16>,
 ) -> String {
     let current_root = tab.root.clone();
-    let new_ai_stack = new_stack_node(
+    let new_stack = new_stack_node(
         allocate_pane_ordinal(&mut tab.next_pane_ordinal),
-        PaneCreatedBy::Ai,
+        created_by,
         source_pane_id,
     );
-    let new_ai_stack_id = match &new_ai_stack {
+    let new_stack_id = match &new_stack {
         LayoutNode::Stack { id, .. } => id.clone(),
         LayoutNode::Split { .. } => unreachable!("new_stack_node must create a stack"),
     };
 
+    let (children, sizes) =
+        split_children_with_sizes(current_root, new_stack, insertion, new_child_size, direction);
+
     tab.root = LayoutNode::Split {
         id: Uuid::new_v4().to_string(),
         direction: direction.to_string(),
-        zone_kind: SplitZoneKind::AiWorkspace,
-        sizes: default_sizes_for_child_count(direction, 2),
-        children: vec![current_root, new_ai_stack],
+        zone_kind: SplitZoneKind::Default,
+        sizes,
+        children,
     };
 
-    new_ai_stack_id
+    new_stack_id
 }
 
 pub fn add_session_to_stack(
@@ -453,6 +522,37 @@ fn default_sizes_for_child_count(direction: &str, child_count: usize) -> Vec<u16
     }
 }
 
+fn split_children_with_sizes(
+    current: LayoutNode,
+    new_child: LayoutNode,
+    insertion: SplitInsertion,
+    new_child_size: Option<u16>,
+    direction: &str,
+) -> (Vec<LayoutNode>, Vec<u16>) {
+    let sizes = split_sizes_for_new_child(new_child_size, insertion, direction);
+    let children = match insertion {
+        SplitInsertion::Before => vec![new_child, current],
+        SplitInsertion::After => vec![current, new_child],
+    };
+    (children, sizes)
+}
+
+fn split_sizes_for_new_child(
+    new_child_size: Option<u16>,
+    insertion: SplitInsertion,
+    direction: &str,
+) -> Vec<u16> {
+    let Some(new_child_size) = new_child_size.map(|size| size.clamp(1, 99)) else {
+        return default_sizes_for_child_count(direction, 2);
+    };
+
+    let existing_size = 100 - new_child_size;
+    match insertion {
+        SplitInsertion::Before => vec![new_child_size, existing_size],
+        SplitInsertion::After => vec![existing_size, new_child_size],
+    }
+}
+
 fn remove_session(
     node: &mut LayoutNode,
     target_stack_id: &str,
@@ -594,7 +694,10 @@ fn remove_stack(
 
 #[cfg(test)]
 mod tests {
-    use super::{first_stack_id, new_workspace_tab, split_stack_node, wrap_root_with_ai_workspace};
+    use super::{
+        SplitInsertion, first_stack_id, new_workspace_tab, split_stack_node,
+        split_stack_node_with_options, wrap_root_with_split,
+    };
     use crate::models::{LayoutNode, PaneCreatedBy, SplitZoneKind};
 
     #[test]
@@ -622,11 +725,20 @@ mod tests {
     }
 
     #[test]
-    fn wrap_root_with_ai_workspace_creates_ai_zone() {
+    fn split_stack_node_with_options_respects_before_and_size() {
         let mut tab = new_workspace_tab("main".to_string());
         let source_id = first_stack_id(&tab.root).expect("root stack");
-        let new_ai_pane_id =
-            wrap_root_with_ai_workspace(&mut tab, "horizontal", Some(source_id.clone()));
+        let new_pane_id = split_stack_node_with_options(
+            &mut tab.root,
+            &source_id,
+            "horizontal",
+            &mut tab.next_pane_ordinal,
+            PaneCreatedBy::Ai,
+            Some(source_id.clone()),
+            SplitInsertion::Before,
+            Some(30),
+        )
+        .expect("new pane id");
 
         match &tab.root {
             LayoutNode::Split {
@@ -635,8 +747,46 @@ mod tests {
                 children,
                 ..
             } => {
-                assert_eq!(sizes, &vec![50, 50]);
-                assert_eq!(zone_kind, &SplitZoneKind::AiWorkspace);
+                assert_eq!(sizes, &vec![30, 70]);
+                assert_eq!(zone_kind, &SplitZoneKind::Default);
+                assert_eq!(children.len(), 2);
+                assert!(matches!(
+                    &children[0],
+                    LayoutNode::Stack {
+                        id,
+                        created_by: PaneCreatedBy::Ai,
+                        source_pane_id: current_source_pane_id,
+                        ..
+                    } if id == &new_pane_id
+                        && current_source_pane_id.as_deref() == Some(source_id.as_str())
+                ));
+            }
+            LayoutNode::Stack { .. } => panic!("expected split root"),
+        }
+    }
+
+    #[test]
+    fn wrap_root_with_split_respects_after_and_size() {
+        let mut tab = new_workspace_tab("main".to_string());
+        let source_id = first_stack_id(&tab.root).expect("root stack");
+        let new_pane_id = wrap_root_with_split(
+            &mut tab,
+            "vertical",
+            PaneCreatedBy::Ai,
+            Some(source_id.clone()),
+            SplitInsertion::After,
+            Some(35),
+        );
+
+        match &tab.root {
+            LayoutNode::Split {
+                sizes,
+                zone_kind,
+                children,
+                ..
+            } => {
+                assert_eq!(sizes, &vec![65, 35]);
+                assert_eq!(zone_kind, &SplitZoneKind::Default);
                 assert_eq!(children.len(), 2);
                 assert!(matches!(
                     &children[1],
@@ -645,11 +795,11 @@ mod tests {
                         created_by: PaneCreatedBy::Ai,
                         source_pane_id: current_source_pane_id,
                         ..
-                    } if id == &new_ai_pane_id
+                    } if id == &new_pane_id
                         && current_source_pane_id.as_deref() == Some(source_id.as_str())
                 ));
             }
-            LayoutNode::Stack { .. } => panic!("expected ai workspace split root"),
+            LayoutNode::Stack { .. } => panic!("expected wrapped root split"),
         }
     }
 }
