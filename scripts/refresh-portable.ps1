@@ -6,10 +6,11 @@ $ErrorActionPreference = "Stop"
 
 $repoRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
 $sourceExe = Join-Path $repoRoot "target\release\workspace-terminal-desktop.exe"
-$portableDir = Join-Path $repoRoot "target\release\bundle\portable\Workspace Terminal Portable"
-$portableExe = Join-Path $portableDir "Workspace Terminal Portable.exe"
+$portableDir = Join-Path $repoRoot "target\release\bundle\portable\Vantara Portable"
+$portableExe = Join-Path $portableDir "Vantara Portable.exe"
 $sourceTmuxExe = Join-Path $repoRoot "target\release\tmux.exe"
-$legacyRootExe = Join-Path $repoRoot "Workspace Terminal Portable.exe"
+$legacyRootExe = Join-Path $repoRoot "Vantara Portable.exe"
+$legacyPortableDir = Join-Path $repoRoot "target\release\bundle\portable\Workspace Terminal Portable"
 $manifestPath = Join-Path $repoRoot "apps\desktop\src-tauri\Cargo.toml"
 
 function Assert-UnlockedFile {
@@ -81,6 +82,10 @@ if (-not $SkipBuild) {
 
 if (-not (Test-Path -LiteralPath $sourceExe)) {
   throw "Release source executable not found: $sourceExe"
+}
+
+if (Test-Path -LiteralPath $legacyPortableDir) {
+  Remove-Item -LiteralPath $legacyPortableDir -Recurse -Force
 }
 
 New-Item -ItemType Directory -Path $portableDir -Force | Out-Null

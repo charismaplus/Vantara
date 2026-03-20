@@ -24,7 +24,7 @@ export class AppErrorBoundary extends Component<AppErrorBoundaryProps, AppErrorB
   }
 
   override componentDidCatch(error: Error, errorInfo: ErrorInfo) {
-    console.error("Workspace Terminal render crash", error, errorInfo);
+    console.error("Vantara render crash", error, errorInfo);
   }
 
   private handleReload = () => {

@@ -156,7 +156,7 @@ export function TerminalView({ sessionId, variant = "user" }: TerminalViewProps)
       scheduleFit("mount");
 
       if (!isTauriRuntime()) {
-        terminal.writeln("Workspace Terminal Mock Preview");
+        terminal.writeln("Vantara Mock Preview");
         terminal.writeln("");
         terminal.writeln("This browser preview renders the layout without Tauri PTY sessions.");
         terminal.writeln("Use the split controls and project navigation to inspect the UI.");

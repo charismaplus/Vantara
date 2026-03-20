@@ -146,7 +146,7 @@ embedded shim이 없는 dev/debug 빌드에서는 기존 sibling `shim/tmux.exe`
 ## 7. 포터블 배포
 
 - 포터블 기준 경로:
-  - `target/release/bundle/portable/Workspace Terminal Portable/Workspace Terminal Portable.exe`
+- `target/release/bundle/portable/Vantara Portable/Vantara Portable.exe`
 - `scripts/refresh-portable.ps1`:
   - `tmux.exe`를 먼저 빌드
   - 그 경로를 `WORKSPACE_TERMINAL_EMBED_TMUX_PATH`로 넘겨 앱 EXE 빌드

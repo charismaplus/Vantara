@@ -2,9 +2,9 @@
 
 포터블 배포 검증 대상은 아래 경로 하나로 고정한다.
 
-- `target/release/bundle/portable/Workspace Terminal Portable/Workspace Terminal Portable.exe`
+- `target/release/bundle/portable/Vantara Portable/Vantara Portable.exe`
 
-루트 경로의 `Workspace Terminal Portable.exe`는 잔존 보조 파일로 취급하며, 배포 검증 기준에 포함하지 않는다.
+루트 경로의 `Vantara Portable.exe`는 잔존 보조 파일로 취급하며, 배포 검증 기준에 포함하지 않는다.
 
 ## 표준 실행 명령
 
@@ -41,6 +41,6 @@ npm run portable:refresh
 
 ## 전달물 기준
 
-- 사용자에게 전달하는 포터블 결과물은 `Workspace Terminal Portable.exe` 단일 파일이다.
+- 사용자에게 전달하는 포터블 결과물은 `Vantara Portable.exe` 단일 파일이다.
 - 포터블 폴더 안에 `shim/` 디렉터리는 남지 않아야 한다.
 - tmux helper는 앱 실행 중 `%TEMP%\WorkspaceTerminal\<hash>\tmux.exe`로 자동 복구된다.

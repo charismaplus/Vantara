@@ -417,22 +417,34 @@ export async function readClipboardPayload(): Promise<PastePayload> {
 }
 
 function createMockState(): MockState {
+  const state: MockState = {
+    counter: 0,
+    projects: [],
+    projectSnapshots: new Map(),
+    sessionSnapshots: new Map(),
+  };
   const project: Project = {
     id: "project-demo",
-    name: "Workspace Terminal",
+    name: "Vantara",
     path: "D:\\FutureTeam\\00002.VantaraC",
     color: "#0ea5e9",
     icon: null,
     lastOpenedAt: now(),
     createdAt: now(),
   };
-  const session = createMockWorkspaceSession(project.id, "main", "user", null);
-  return {
-    counter: 0,
-    projects: [project],
-    projectSnapshots: new Map([[project.id, { projectId: project.id, sessions: [session] }]]),
-    sessionSnapshots: new Map([[session.id, createEmptySessionSnapshot(project.id, session.id)]]),
+  const session: WorkspaceSession = {
+    id: nextStateId(state, "workspace-session"),
+    projectId: project.id,
+    name: "main",
+    createdBy: "user",
+    sourceSessionId: null,
+    lastOpenedAt: now(),
+    createdAt: now(),
   };
+  state.projects = [project];
+  state.projectSnapshots.set(project.id, { projectId: project.id, sessions: [session] });
+  state.sessionSnapshots.set(session.id, createEmptySessionSnapshot(project.id, session.id));
+  return state;
 }
 
 function now() {
@@ -440,8 +452,12 @@ function now() {
 }
 
 function nextId(prefix: string) {
-  mockState.counter += 1;
-  return `${prefix}-${mockState.counter}`;
+  return nextStateId(mockState, prefix);
+}
+
+function nextStateId(state: MockState, prefix: string) {
+  state.counter += 1;
+  return `${prefix}-${state.counter}`;
 }
 
 function cloneProjectSnapshot(snapshot: ProjectWorkspaceSnapshot) {

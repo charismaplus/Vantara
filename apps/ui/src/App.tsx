@@ -1,4 +1,4 @@
-import type { ReactNode } from "react";
+import type { ReactNode, MouseEvent as ReactMouseEvent } from "react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Group as PanelGroup, Panel, Separator as PanelResizeHandle } from "react-resizable-panels";
 import type {
@@ -41,6 +41,7 @@ import {
 } from "./lib/desktop";
 import { getActiveTab, isSplitNode, isStackNode } from "./lib/layout";
 import { pasteTerminalInput, writeTerminalChunk } from "./lib/terminalRegistry";
+import vantaraLogo from "../../../docs/Logo.png";
 
 type LauncherProfile = {
   id: string;
@@ -52,6 +53,21 @@ type LauncherProfile = {
   theme: "claude" | "claude-danger" | "codex" | "codex-auto" | "terminal";
   sessionTitle: string;
 };
+
+type SidebarContextMenuState =
+  | {
+      kind: "project";
+      project: Project;
+      x: number;
+      y: number;
+    }
+  | {
+      kind: "session";
+      project: Project;
+      session: WorkspaceSession;
+      x: number;
+      y: number;
+    };
 
 const launcherRows: LauncherProfile[][] = [
   [
@@ -113,6 +129,10 @@ function withTimeout<T>(promise: Promise<T>, timeoutMs: number, timeoutMessage: 
   });
 }
 
+function getErrorMessage(error: unknown) {
+  return error instanceof Error ? error.message : String(error);
+}
+
 export default function App() {
   const [projects, setProjects] = useState<Project[]>([]);
   const [activeProjectId, setActiveProjectId] = useState<string | null>(null);
@@ -131,7 +151,12 @@ export default function App() {
   const [renamingProjectName, setRenamingProjectName] = useState("");
   const [pendingDeleteProject, setPendingDeleteProject] = useState<Project | null>(null);
   const [pendingDeleteSession, setPendingDeleteSession] = useState<WorkspaceSession | null>(null);
+  const [sidebarContextMenu, setSidebarContextMenu] = useState<SidebarContextMenuState | null>(null);
   const workspaceCanvasRef = useRef<HTMLElement | null>(null);
+  const activeProjectIdRef = useRef<string | null>(null);
+  const activeWorkspaceSessionIdRef = useRef<string | null>(null);
+  const refreshProjectSummaryRef = useRef<(projectId: string) => Promise<void>>(async () => {});
+  const refreshCurrentSelectionRef = useRef<() => Promise<void>>(async () => {});
 
   const activeProject = useMemo(() => projects.find((entry) => entry.id === activeProjectId) ?? null, [projects, activeProjectId]);
   const activeWorkspaceSession = useMemo(
@@ -152,6 +177,14 @@ export default function App() {
   }, [activeWindow]);
 
   useEffect(() => {
+    activeProjectIdRef.current = activeProjectId;
+  }, [activeProjectId]);
+
+  useEffect(() => {
+    activeWorkspaceSessionIdRef.current = activeWorkspaceSessionId;
+  }, [activeWorkspaceSessionId]);
+
+  useEffect(() => {
     void (async () => {
       try {
         const loadedProjects = await listProjects();
@@ -159,6 +192,8 @@ export default function App() {
         if (loadedProjects[0]) {
           setExpandedProjectIds({ [loadedProjects[0].id]: true });
           setLoading(true);
+          activeProjectIdRef.current = loadedProjects[0].id;
+          activeWorkspaceSessionIdRef.current = null;
           setActiveProjectId(loadedProjects[0].id);
           setActiveWorkspaceSessionId(null);
           setSessionSnapshot(null);
@@ -173,63 +208,113 @@ export default function App() {
     })();
   }, []);
 
-  useEffect(() => {
-    const disposers: Array<() => void> = [];
-    const refreshCurrent = () => {
-      if (!activeProjectId) {
-        return;
-      }
-      void (async () => {
-        setLoading(true);
-        try {
-          const nextProjectSnapshot = await openProject(activeProjectId);
-          setProjectSnapshot(nextProjectSnapshot);
-          setProjects(await listProjects());
-          if (activeWorkspaceSessionId && nextProjectSnapshot.sessions.some((entry) => entry.id === activeWorkspaceSessionId)) {
-            setSessionSnapshot(await openSession(activeProjectId, activeWorkspaceSessionId));
-          } else if (activeWorkspaceSessionId) {
-            setActiveWorkspaceSessionId(null);
-            setSessionSnapshot(null);
-          }
-        } catch (error) {
-          showError(error);
-        } finally {
-          setLoading(false);
+  async function refreshProjectSummary(projectId: string) {
+    try {
+      const nextProjectSnapshot = await openProject(projectId);
+      setProjectSnapshot(nextProjectSnapshot);
+      setProjects(await listProjects());
+    } catch (error) {
+      showError(error);
+    }
+  }
+
+  async function refreshCurrentSelection() {
+    const projectId = activeProjectIdRef.current;
+    if (!projectId) {
+      return;
+    }
+
+    setLoading(true);
+    try {
+      const nextProjectSnapshot = await openProject(projectId);
+      setProjectSnapshot(nextProjectSnapshot);
+      setProjects(await listProjects());
+
+      const workspaceSessionId = activeWorkspaceSessionIdRef.current;
+      if (workspaceSessionId && nextProjectSnapshot.sessions.some((entry) => entry.id === workspaceSessionId)) {
+        setSessionSnapshot(await openSession(projectId, workspaceSessionId));
+      } else {
+        if (workspaceSessionId) {
+          activeWorkspaceSessionIdRef.current = null;
+          setActiveWorkspaceSessionId(null);
         }
-      })();
+        setSessionSnapshot(null);
+      }
+    } catch (error) {
+      showError(error);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  refreshProjectSummaryRef.current = refreshProjectSummary;
+  refreshCurrentSelectionRef.current = refreshCurrentSelection;
+
+  useEffect(() => {
+    let disposed = false;
+    let outputDispose: (() => void) | null = null;
+    let exitDispose: (() => void) | null = null;
+    let workspaceDispose: (() => void) | null = null;
+
+    const bindListener = (
+      promise: Promise<() => void>,
+      assign: (dispose: () => void) => void,
+    ) => {
+      void promise
+        .then((dispose) => {
+          if (disposed) {
+            dispose();
+            return;
+          }
+          assign(dispose);
+        })
+        .catch((error) => setErrorMessage(getErrorMessage(error)));
     };
 
-    void listenSessionOutput((event) => writeTerminalChunk(event.payload.sessionId, event.payload.chunk)).then((dispose) => disposers.push(dispose));
+    bindListener(
+      listenSessionOutput((event) => writeTerminalChunk(event.payload.sessionId, event.payload.chunk)),
+      (dispose) => {
+        outputDispose = dispose;
+      },
+    );
 
-    void listenSessionExit(() => {
-      refreshCurrent();
-    }).then((dispose) => disposers.push(dispose));
+    bindListener(
+      listenSessionExit(() => {
+        void refreshCurrentSelectionRef.current();
+      }),
+      (dispose) => {
+        exitDispose = dispose;
+      },
+    );
 
-    void listenWorkspaceChanged((event) => {
-      if (!activeProjectId || event.payload.projectId !== activeProjectId) {
-        return;
-      }
-      if (event.payload.sessionId && activeWorkspaceSessionId && event.payload.sessionId !== activeWorkspaceSessionId) {
-        void (async () => {
-          try {
-            const nextProjectSnapshot = await openProject(activeProjectId);
-            setProjectSnapshot(nextProjectSnapshot);
-            setProjects(await listProjects());
-          } catch (error) {
-            showError(error);
-          }
-        })();
-        return;
-      }
-      refreshCurrent();
-    }).then((dispose) => disposers.push(dispose));
+    bindListener(
+      listenWorkspaceChanged((event) => {
+        const projectId = activeProjectIdRef.current;
+        const workspaceSessionId = activeWorkspaceSessionIdRef.current;
+
+        if (!projectId || event.payload.projectId !== projectId) {
+          return;
+        }
+
+        if (event.payload.sessionId && workspaceSessionId && event.payload.sessionId !== workspaceSessionId) {
+          void refreshProjectSummaryRef.current(projectId);
+          return;
+        }
+
+        void refreshCurrentSelectionRef.current();
+      }),
+      (dispose) => {
+        workspaceDispose = dispose;
+      },
+    );
 
     return () => {
-      for (const dispose of disposers) {
-        dispose();
-      }
+      disposed = true;
+      outputDispose?.();
+      exitDispose?.();
+      workspaceDispose?.();
     };
-  }, [activeProjectId, activeWorkspaceSessionId]);
+  }, []);
 
   useEffect(() => {
     const element = workspaceCanvasRef.current;
@@ -266,7 +351,9 @@ export default function App() {
   }, [activeProjectId, activeWindow]);
 
   useEffect(() => {
+    let disposed = false;
     let dispose: (() => void) | null = null;
+
     void listenWindowFileDrop((event) => {
       if (event.type !== "drop" || !event.paths.length || !event.position) {
         return;
@@ -278,11 +365,45 @@ export default function App() {
       if (sessionId) {
         pasteTerminalInput(sessionId, event.paths.join(" "));
       }
-    }).then((unlisten) => {
-      dispose = unlisten;
-    });
-    return () => dispose?.();
+    })
+      .then((unlisten) => {
+        if (disposed) {
+          unlisten();
+          return;
+        }
+        dispose = unlisten;
+      })
+      .catch((error) => setErrorMessage(getErrorMessage(error)));
+
+    return () => {
+      disposed = true;
+      dispose?.();
+    };
   }, []);
+
+  useEffect(() => {
+    if (!sidebarContextMenu) {
+      return;
+    }
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setSidebarContextMenu(null);
+      }
+    };
+
+    const handleWindowBlur = () => {
+      setSidebarContextMenu(null);
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+    window.addEventListener("blur", handleWindowBlur);
+
+    return () => {
+      window.removeEventListener("keydown", handleKeyDown);
+      window.removeEventListener("blur", handleWindowBlur);
+    };
+  }, [sidebarContextMenu]);
 
   async function refreshProjectOnly(projectId: string) {
     const nextProjectSnapshot = await openProject(projectId);
@@ -290,6 +411,7 @@ export default function App() {
     const nextProjects = await listProjects();
     setProjects(nextProjects);
     if (activeWorkspaceSessionId && !nextProjectSnapshot.sessions.some((entry) => entry.id === activeWorkspaceSessionId)) {
+      activeWorkspaceSessionIdRef.current = null;
       setActiveWorkspaceSessionId(null);
       setSessionSnapshot(null);
     }
@@ -298,7 +420,10 @@ export default function App() {
   async function selectProject(projectId: string) {
     setLoading(true);
     setErrorMessage(null);
+    setSidebarContextMenu(null);
     try {
+      activeProjectIdRef.current = projectId;
+      activeWorkspaceSessionIdRef.current = null;
       setActiveProjectId(projectId);
       setActiveWorkspaceSessionId(null);
       setSessionSnapshot(null);
@@ -315,7 +440,10 @@ export default function App() {
   async function selectWorkspaceSession(projectId: string, workspaceSessionId: string) {
     setLoading(true);
     setErrorMessage(null);
+    setSidebarContextMenu(null);
     try {
+      activeProjectIdRef.current = projectId;
+      activeWorkspaceSessionIdRef.current = workspaceSessionId;
       setActiveProjectId(projectId);
       setActiveWorkspaceSessionId(workspaceSessionId);
       setExpandedProjectIds((current) => ({ ...current, [projectId]: true }));
@@ -394,22 +522,92 @@ export default function App() {
     }
   }
 
-  async function launchFromSessionSurface(profile: LauncherProfile) {
-    if (!activeProjectId || !activeWorkspaceSessionId) {
-      return;
-    }
-    await refreshSessionSnapshot(createSession({
-      projectId: activeProjectId,
-      workspaceSessionId: activeWorkspaceSessionId,
-      title: profile.sessionTitle,
-      program: profile.program,
-      args: profile.args,
-      launchProfile: profile.launchProfile,
-    }));
+  function showError(error: unknown) {
+    setErrorMessage(getErrorMessage(error));
   }
 
-  function showError(error: unknown) {
-    setErrorMessage(error instanceof Error ? error.message : String(error));
+  function resolveContextMenuPosition(clientX: number, clientY: number) {
+    const menuWidth = 196;
+    const menuHeight = 172;
+    const padding = 10;
+    return {
+      x: Math.max(padding, Math.min(clientX, window.innerWidth - menuWidth - padding)),
+      y: Math.max(padding, Math.min(clientY, window.innerHeight - menuHeight - padding)),
+    };
+  }
+
+  function openProjectContextMenu(event: ReactMouseEvent<HTMLElement>, project: Project) {
+    event.preventDefault();
+    const position = resolveContextMenuPosition(event.clientX, event.clientY);
+    setSidebarContextMenu({
+      kind: "project",
+      project,
+      x: position.x,
+      y: position.y,
+    });
+  }
+
+  function openSessionContextMenu(event: ReactMouseEvent<HTMLElement>, project: Project, session: WorkspaceSession) {
+    event.preventDefault();
+    const position = resolveContextMenuPosition(event.clientX, event.clientY);
+    setSidebarContextMenu({
+      kind: "session",
+      project,
+      session,
+      x: position.x,
+      y: position.y,
+    });
+  }
+
+  async function commitProjectRename(projectId: string) {
+    const nextName = renamingProjectName.trim();
+    if (!nextName) {
+      showError(new Error("Project name is required"));
+      setRenamingProjectId(null);
+      setRenamingProjectName("");
+      return;
+    }
+    await renameProject(projectId, nextName);
+    setRenamingProjectId(null);
+    setRenamingProjectName("");
+    await refreshProjectOnly(projectId);
+  }
+
+  async function createAndOpenSession(projectId: string) {
+    const session = await createWorkspaceSession(projectId);
+    await selectWorkspaceSession(projectId, session.id);
+  }
+
+  async function handleProjectContextAction(action: "rename" | "delete", project: Project) {
+    setSidebarContextMenu(null);
+    if (action === "rename") {
+      setRenamingProjectId(project.id);
+      setRenamingProjectName(project.name);
+      return;
+    }
+    setPendingDeleteProject(project);
+  }
+
+  async function handleSessionContextAction(action: "open" | "rename" | "delete", project: Project, session: WorkspaceSession) {
+    setSidebarContextMenu(null);
+    if (action === "open") {
+      await selectWorkspaceSession(project.id, session.id);
+      return;
+    }
+    if (action === "rename") {
+      const nextName = window.prompt("Rename session", session.name);
+      if (!nextName?.trim()) {
+        return;
+      }
+      try {
+        await renameWorkspaceSession(project.id, session.id, nextName.trim());
+        await refreshProjectOnly(project.id);
+      } catch (error) {
+        showError(error);
+      }
+      return;
+    }
+    setPendingDeleteSession(session);
   }
 
   function renderLauncherSurface(onLaunch: (profile: LauncherProfile) => void) {
@@ -522,51 +720,97 @@ export default function App() {
       <div className="app-shell">
         <aside className="sidebar">
           <div className="sidebar-header">
-            <div><p className="eyebrow">Workspace Terminal</p><h1>Projects</h1></div>
-            <button className="toolbar-button primary" onClick={() => setIsProjectModalOpen(true)}>Add Project</button>
+            <div className="sidebar-brand">
+              <img className="sidebar-logo" src={vantaraLogo} alt="Vantara" />
+            </div>
+            <div className="sidebar-section-header">
+              <h1>Projects</h1>
+              <button className="toolbar-button primary" onClick={() => setIsProjectModalOpen(true)}>Add Project</button>
+            </div>
           </div>
           {errorMessage ? <div className="error-banner">{errorMessage}</div> : null}
-          <div className="project-list">
+          <div className="sidebar-tree">
             {projects.map((project) => {
               const projectSessions = projectSnapshot?.projectId === project.id ? projectSnapshot.sessions : [];
               return (
-                <div key={project.id} className={`project-card ${project.id === activeProjectId ? "active" : ""}`}>
-                  <span className="project-color" style={{ background: project.color }} />
+                <div key={project.id} className={`tree-group ${project.id === activeProjectId ? "active" : ""}`}>
                   {renamingProjectId === project.id ? (
-                    <div className="project-card-main project-card-main-static">
-                      <div className="project-card-content">
-                        <input className="project-inline-input" value={renamingProjectName} onChange={(event) => setRenamingProjectName(event.target.value)} onBlur={() => renameProject(project.id, renamingProjectName.trim()).then(async () => { setRenamingProjectId(null); await refreshProjectOnly(project.id); }).catch(showError)} autoFocus />
+                    <div className="tree-row tree-row-project tree-row-static">
+                      <span className="project-color" style={{ background: project.color }} />
+                      <div className="tree-inline-edit">
+                        <input
+                          className="project-inline-input"
+                          value={renamingProjectName}
+                          onChange={(event) => setRenamingProjectName(event.target.value)}
+                          onBlur={() => void commitProjectRename(project.id).catch(showError)}
+                          onKeyDown={(event) => {
+                            if (event.key === "Enter") {
+                              void commitProjectRename(project.id).catch(showError);
+                            } else if (event.key === "Escape") {
+                              setRenamingProjectId(null);
+                              setRenamingProjectName("");
+                            }
+                          }}
+                          autoFocus
+                        />
                       </div>
                     </div>
                   ) : (
-                    <div>
-                      <div className="project-card-main" onClick={() => void selectProject(project.id)}>
-                        <div className="project-card-content"><strong>{project.name}</strong><div className="project-path">{project.path}</div></div>
-                      </div>
-                      <div className="project-card-actions">
-                        <button className="project-action-button" onClick={() => setExpandedProjectIds((current) => ({ ...current, [project.id]: !current[project.id] }))}>{expandedProjectIds[project.id] ? "Collapse" : "Expand"}</button>
-                        <button className="project-action-button" onClick={() => { setRenamingProjectId(project.id); setRenamingProjectName(project.name); }}>Rename</button>
-                        <button className="project-action-button danger" onClick={() => setPendingDeleteProject(project)}>Delete</button>
+                    <>
+                      <div
+                        className={`tree-row tree-row-project ${project.id === activeProjectId ? "active" : ""}`}
+                        onClick={() => void selectProject(project.id)}
+                        onContextMenu={(event) => openProjectContextMenu(event, project)}
+                      >
+                        <span className="project-color" style={{ background: project.color }} />
+                        <button
+                          className={`tree-disclosure ${expandedProjectIds[project.id] ? "expanded" : ""}`}
+                          aria-label={expandedProjectIds[project.id] ? "Collapse sessions" : "Expand sessions"}
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            setExpandedProjectIds((current) => ({ ...current, [project.id]: !current[project.id] }));
+                          }}
+                        >
+                          <span className="tree-disclosure-glyph">{">"}</span>
+                        </button>
+                        <div className="tree-row-body">
+                          <strong>{project.name}</strong>
+                          <div className="project-path">{project.path}</div>
+                        </div>
+                        <span className="tree-row-surface">Project</span>
                       </div>
                       {expandedProjectIds[project.id] ? (
-                        <div className="project-list" style={{ paddingLeft: 12 }}>
+                        <div className="tree-children">
                           {projectSessions.map((session) => (
-                            <div key={session.id} className={`project-card ${session.id === activeWorkspaceSessionId ? "active" : ""}`}>
-                              <button className="project-card-main" onClick={() => void selectWorkspaceSession(project.id, session.id)}>
-                                <div className="project-card-content">
-                                  <strong>{session.name}</strong>
-                                  <div className="project-path">{session.createdBy === "ai" ? "AI Session" : "User Session"}</div>
-                                </div>
-                              </button>
-                              <div className="project-card-actions">
-                                <button className="project-action-button" onClick={() => { const nextName = window.prompt("Rename session", session.name); if (nextName?.trim()) { void renameWorkspaceSession(project.id, session.id, nextName.trim()).then(() => refreshProjectOnly(project.id)).catch(showError); } }}>Rename</button>
-                                <button className="project-action-button danger" onClick={() => setPendingDeleteSession(session)}>Delete</button>
+                            <div
+                              key={session.id}
+                              className={`tree-row tree-row-session ${session.id === activeWorkspaceSessionId ? "active" : ""}`}
+                              onClick={() => void selectWorkspaceSession(project.id, session.id)}
+                              onContextMenu={(event) => openSessionContextMenu(event, project, session)}
+                            >
+                              <span className="tree-branch" />
+                              <span className={`tree-session-badge ${session.createdBy === "ai" ? "ai" : "user"}`}>
+                                {session.createdBy === "ai" ? "AI" : "S"}
+                              </span>
+                              <div className="tree-row-body">
+                                <strong>{session.name}</strong>
+                                <div className="project-path">{session.createdBy === "ai" ? "AI session" : "Session"}</div>
                               </div>
+                              <span className="tree-row-surface">Session</span>
                             </div>
                           ))}
+                          <div className="tree-inline-action-row">
+                            <span className="tree-branch" />
+                            <button
+                              className="tree-inline-action-button"
+                              onClick={() => void createAndOpenSession(project.id).catch(showError)}
+                            >
+                              New Session
+                            </button>
+                          </div>
                         </div>
                       ) : null}
-                    </div>
+                    </>
                   )}
                 </div>
               );
@@ -580,12 +824,8 @@ export default function App() {
               <p className="eyebrow">{activeWorkspaceSession ? "Session Workspace" : "Project Sessions"}</p>
               <h2>{activeWorkspaceSession?.name ?? activeProject?.name ?? "No project selected"}</h2>
             </div>
-            {activeProjectId ? (
-              activeWorkspaceSession ? (
-                <button className="toolbar-button primary" onClick={() => void refreshSessionSnapshot(createWindow(activeProjectId, activeWorkspaceSession.id))}>New Window</button>
-              ) : (
-                <button className="toolbar-button primary" onClick={() => createWorkspaceSession(activeProjectId).then((session) => selectWorkspaceSession(activeProjectId, session.id)).catch(showError)}>New Session</button>
-              )
+            {activeProjectId && activeWorkspaceSession ? (
+              <button className="toolbar-button primary" onClick={() => void refreshSessionSnapshot(createWindow(activeProjectId, activeWorkspaceSession.id))}>New Window</button>
             ) : null}
           </header>
 
@@ -600,15 +840,7 @@ export default function App() {
                 ))}
               </div>
               <section className="workspace-canvas" ref={workspaceCanvasRef} onDragOver={(event) => event.preventDefault()} onDrop={(event) => event.preventDefault()}>
-                {loading ? <div className="empty-state">Loading workspace...</div> : activeWindow ? renderNode(activeWindow.root, false) : (
-                  <div className="empty-state">
-                    <p>This session has no windows yet.</p>
-                    <div style={{ marginBottom: 16 }}>
-                      <button className="toolbar-button primary" onClick={() => activeProjectId && void refreshSessionSnapshot(createWindow(activeProjectId, activeWorkspaceSession.id))}>New Window</button>
-                    </div>
-                    {renderLauncherSurface((profile) => launchFromSessionSurface(profile))}
-                  </div>
-                )}
+                {loading ? <div className="empty-state">Loading workspace...</div> : activeWindow ? renderNode(activeWindow.root, false) : <div className="empty-state">Preparing session window...</div>}
               </section>
             </>
           ) : (
@@ -616,11 +848,16 @@ export default function App() {
               {loading ? <div className="empty-state">Loading project...</div> : activeProject ? (
                 <div className="project-list">
                   {(projectSnapshot?.sessions ?? []).map((session) => (
-                    <div key={session.id} className="project-card">
-                      <button className="project-card-main" onClick={() => void selectWorkspaceSession(activeProject.id, session.id)}>
-                        <div className="project-card-content">
+                    <div key={session.id} className="session-list-card">
+                      <button className="session-list-card-main" onClick={() => void selectWorkspaceSession(activeProject.id, session.id)}>
+                        <div className="session-list-card-content">
                           <strong>{session.name}</strong>
-                          <div className="project-path">{session.createdBy === "ai" ? "AI generated session" : "User session"}</div>
+                          <div className="session-list-card-meta">
+                            <span className={`tree-session-badge ${session.createdBy === "ai" ? "ai" : "user"}`}>
+                              {session.createdBy === "ai" ? "AI" : "S"}
+                            </span>
+                            <span>{session.createdBy === "ai" ? "AI generated session" : "User session"}</span>
+                          </div>
                         </div>
                       </button>
                     </div>
@@ -633,9 +870,33 @@ export default function App() {
 
         {isProjectModalOpen ? <div className="modal-backdrop" onClick={(event) => event.target === event.currentTarget && setIsProjectModalOpen(false)}><div className="modal-card"><div className="modal-header"><div><p className="eyebrow">New Project</p><h3>Add a local workspace</h3></div><button className="toolbar-button" onClick={() => setIsProjectModalOpen(false)}>Close</button></div><div className="project-form modal-form"><input placeholder="Project name" value={newProjectName} onChange={(event) => setNewProjectName(event.target.value)} autoFocus /><div className="path-field"><input placeholder="Absolute path" value={newProjectPath} onChange={(event) => setNewProjectPath(event.target.value)} /><button className="toolbar-button" onClick={() => void browseForProjectPath()}>Browse</button></div><div className="modal-actions"><button className="toolbar-button" onClick={() => setIsProjectModalOpen(false)}>Cancel</button><button className="toolbar-button primary" onClick={() => void submitProject()}>Add Project</button></div></div></div></div> : null}
 
-        {pendingDeleteProject ? <div className="modal-backdrop" onClick={(event) => event.target === event.currentTarget && setPendingDeleteProject(null)}><div className="modal-card modal-card-compact"><div className="modal-header"><div><p className="eyebrow">Remove Project</p><h3>{pendingDeleteProject.name}</h3></div><button className="toolbar-button" onClick={() => setPendingDeleteProject(null)}>Close</button></div><p className="modal-copy">This removes the project from Workspace Terminal only. The actual folder stays on disk.</p><div className="modal-actions"><button className="toolbar-button" onClick={() => setPendingDeleteProject(null)}>Cancel</button><button className="toolbar-button subtle" onClick={() => deleteProject(pendingDeleteProject.id).then(async (result) => { setPendingDeleteProject(null); const nextProjects = await listProjects(); setProjects(nextProjects); if (result.nextProjectId) { await selectProject(result.nextProjectId); } else { setActiveProjectId(null); setProjectSnapshot(null); setActiveWorkspaceSessionId(null); setSessionSnapshot(null); } }).catch(showError)}>Delete Project</button></div></div></div> : null}
+        {pendingDeleteProject ? <div className="modal-backdrop" onClick={(event) => event.target === event.currentTarget && setPendingDeleteProject(null)}><div className="modal-card modal-card-compact"><div className="modal-header"><div><p className="eyebrow">Remove Project</p><h3>{pendingDeleteProject.name}</h3></div><button className="toolbar-button" onClick={() => setPendingDeleteProject(null)}>Close</button></div><p className="modal-copy">This removes the project from Vantara only. The actual folder stays on disk.</p><div className="modal-actions"><button className="toolbar-button" onClick={() => setPendingDeleteProject(null)}>Cancel</button><button className="toolbar-button subtle" onClick={() => deleteProject(pendingDeleteProject.id).then(async (result) => { setPendingDeleteProject(null); const nextProjects = await listProjects(); setProjects(nextProjects); if (result.nextProjectId) { await selectProject(result.nextProjectId); } else { activeProjectIdRef.current = null; activeWorkspaceSessionIdRef.current = null; setActiveProjectId(null); setProjectSnapshot(null); setActiveWorkspaceSessionId(null); setSessionSnapshot(null); } }).catch(showError)}>Delete Project</button></div></div></div> : null}
 
-        {pendingDeleteSession && activeProjectId ? <div className="modal-backdrop" onClick={(event) => event.target === event.currentTarget && setPendingDeleteSession(null)}><div className="modal-card modal-card-compact"><div className="modal-header"><div><p className="eyebrow">Remove Session</p><h3>{pendingDeleteSession.name}</h3></div><button className="toolbar-button" onClick={() => setPendingDeleteSession(null)}>Close</button></div><p className="modal-copy">This removes the session node and its runtime terminals. The project remains intact.</p><div className="modal-actions"><button className="toolbar-button" onClick={() => setPendingDeleteSession(null)}>Cancel</button><button className="toolbar-button subtle" onClick={() => deleteWorkspaceSession(activeProjectId, pendingDeleteSession.id).then((nextSnapshot) => { setPendingDeleteSession(null); setProjectSnapshot(nextSnapshot); if (activeWorkspaceSessionId === pendingDeleteSession.id) { setActiveWorkspaceSessionId(null); setSessionSnapshot(null); } }).catch(showError)}>Delete Session</button></div></div></div> : null}
+        {pendingDeleteSession && activeProjectId ? <div className="modal-backdrop" onClick={(event) => event.target === event.currentTarget && setPendingDeleteSession(null)}><div className="modal-card modal-card-compact"><div className="modal-header"><div><p className="eyebrow">Remove Session</p><h3>{pendingDeleteSession.name}</h3></div><button className="toolbar-button" onClick={() => setPendingDeleteSession(null)}>Close</button></div><p className="modal-copy">This removes the session node and its runtime terminals. The project remains intact.</p><div className="modal-actions"><button className="toolbar-button" onClick={() => setPendingDeleteSession(null)}>Cancel</button><button className="toolbar-button subtle" onClick={() => deleteWorkspaceSession(activeProjectId, pendingDeleteSession.id).then((nextSnapshot) => { setPendingDeleteSession(null); setProjectSnapshot(nextSnapshot); if (activeWorkspaceSessionId === pendingDeleteSession.id) { activeWorkspaceSessionIdRef.current = null; setActiveWorkspaceSessionId(null); setSessionSnapshot(null); } }).catch(showError)}>Delete Session</button></div></div></div> : null}
+
+        {sidebarContextMenu ? (
+          <div className="context-menu-layer" onClick={() => setSidebarContextMenu(null)} onContextMenu={(event) => event.preventDefault()}>
+            <div
+              className="context-menu"
+              style={{ left: sidebarContextMenu.x, top: sidebarContextMenu.y }}
+              onClick={(event) => event.stopPropagation()}
+              onContextMenu={(event) => event.preventDefault()}
+            >
+              {sidebarContextMenu.kind === "project" ? (
+                <>
+                  <button className="context-menu-item" onClick={() => void handleProjectContextAction("rename", sidebarContextMenu.project)}>Rename Project</button>
+                  <button className="context-menu-item danger" onClick={() => void handleProjectContextAction("delete", sidebarContextMenu.project)}>Delete Project</button>
+                </>
+              ) : (
+                <>
+                  <button className="context-menu-item" onClick={() => void handleSessionContextAction("open", sidebarContextMenu.project, sidebarContextMenu.session)}>Open Session</button>
+                  <button className="context-menu-item" onClick={() => void handleSessionContextAction("rename", sidebarContextMenu.project, sidebarContextMenu.session)}>Rename Session</button>
+                  <button className="context-menu-item danger" onClick={() => void handleSessionContextAction("delete", sidebarContextMenu.project, sidebarContextMenu.session)}>Delete Session</button>
+                </>
+              )}
+            </div>
+          </div>
+        ) : null}
       </div>
     </AppErrorBoundary>
   );

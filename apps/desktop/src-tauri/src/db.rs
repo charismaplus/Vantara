@@ -236,7 +236,7 @@ impl Database {
                 "SELECT id, project_id, name, created_by, source_session_id, last_opened_at, created_at
                  FROM workspace_sessions
                  WHERE project_id = ?1
-                 ORDER BY COALESCE(last_opened_at, created_at) DESC, created_at ASC",
+                 ORDER BY created_at ASC, id ASC",
             )
             .map_err(|err| err.to_string())?;
 

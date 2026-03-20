@@ -6816,14 +6816,7 @@ fn load_workspace_session_snapshot(
     };
 
     if let Some(snapshot) = cached_snapshot {
-        let mut snapshot = snapshot;
-        refresh_snapshot_sessions(state, &mut snapshot)?;
-        state
-            .workspaces
-            .lock()
-            .map_err(|_| "Workspace cache lock poisoned".to_string())?
-            .insert(workspace_session_id.to_string(), snapshot.clone());
-        return Ok(snapshot);
+        return persist_workspace_snapshot(state, snapshot);
     }
 
     let snapshot = WorkspaceSnapshot {
@@ -6860,6 +6853,8 @@ fn persist_workspace_snapshot(
     state: &AppState,
     mut snapshot: WorkspaceSnapshot,
 ) -> Result<WorkspaceSnapshot, String> {
+    ensure_workspace_snapshot_has_window(&mut snapshot);
+
     for tab in snapshot.tabs.iter_mut() {
         normalize_tab(tab);
     }
@@ -6879,6 +6874,17 @@ fn persist_workspace_snapshot(
         .map_err(|_| "Workspace cache lock poisoned".to_string())?
         .insert(snapshot.session_id.clone(), snapshot.clone());
     Ok(snapshot)
+}
+
+fn ensure_workspace_snapshot_has_window(snapshot: &mut WorkspaceSnapshot) -> bool {
+    if !snapshot.tabs.is_empty() {
+        return false;
+    }
+
+    let window = new_workspace_tab("main".to_string());
+    snapshot.active_tab_id = Some(window.id.clone());
+    snapshot.tabs.push(window);
+    true
 }
 
 fn ensure_session_spawn_target(
@@ -6946,7 +6952,7 @@ mod tests {
         current_tmux_pane_id, query_flag, remove_session_from_snapshot,
         render_tmux_client_format, render_tmux_session_format, render_tmux_window_format,
         resolve_directional_pane_id, resolve_relative_window_id, resolve_target_window_id,
-        resolve_tmux_split_direction, split_tmux_pane,
+        resolve_tmux_split_direction, split_tmux_pane, ensure_workspace_snapshot_has_window,
     };
     use crate::layout::{add_session_to_stack, first_stack_id, new_workspace_tab};
     use crate::layout::SplitInsertion;
@@ -7062,6 +7068,42 @@ mod tests {
             }
             LayoutNode::Split { .. } => panic!("expected launcher root"),
         }
+    }
+
+    #[test]
+    fn empty_session_snapshot_materializes_main_window() {
+        let mut snapshot = WorkspaceSnapshot {
+            project_id: "project-1".to_string(),
+            session_id: "workspace-session-1".to_string(),
+            active_tab_id: None,
+            tabs: Vec::new(),
+            sessions: Vec::new(),
+        };
+
+        assert!(ensure_workspace_snapshot_has_window(&mut snapshot));
+        assert_eq!(snapshot.tabs.len(), 1);
+        assert_eq!(snapshot.tabs[0].title, "main");
+        assert_eq!(
+            snapshot.active_tab_id.as_deref(),
+            Some(snapshot.tabs[0].id.as_str())
+        );
+    }
+
+    #[test]
+    fn existing_window_invariant_is_preserved() {
+        let existing = new_workspace_tab("window-1".to_string());
+        let existing_id = existing.id.clone();
+        let mut snapshot = WorkspaceSnapshot {
+            project_id: "project-1".to_string(),
+            session_id: "workspace-session-1".to_string(),
+            active_tab_id: Some(existing_id.clone()),
+            tabs: vec![existing],
+            sessions: Vec::new(),
+        };
+
+        assert!(!ensure_workspace_snapshot_has_window(&mut snapshot));
+        assert_eq!(snapshot.tabs.len(), 1);
+        assert_eq!(snapshot.tabs[0].id, existing_id);
     }
 
     #[test]
