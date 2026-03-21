@@ -15,7 +15,10 @@ use tauri::{AppHandle, Emitter, Manager};
 
 use crate::{
     db::{Database, now_iso},
-    models::{SessionExitEvent, SessionOutputEvent, SessionStatus, TerminalSession},
+    models::{
+        LaunchProfile, SessionExitEvent, SessionOutputEvent, SessionSidebarStatus,
+        SessionStatus, SessionStatusProvider, TerminalSession,
+    },
 };
 
 const TMUX_SHELL_READY_PHASE1_TIMEOUT: Duration = Duration::from_millis(1_500);
@@ -87,6 +90,7 @@ struct SessionRuntime {
 #[derive(Clone, Default)]
 pub struct SessionManager {
     runtimes: Arc<Mutex<HashMap<String, SessionRuntime>>>,
+    sidebar_statuses: Arc<Mutex<HashMap<String, SessionSidebarStatus>>>,
 }
 
 impl SessionManager {
@@ -128,6 +132,8 @@ impl SessionManager {
         session.ended_at = None;
         session.exit_code = None;
 
+        let initial_sidebar_status = build_initial_sidebar_status(&session);
+
         {
             let db_guard = db
                 .lock()
@@ -135,10 +141,16 @@ impl SessionManager {
             db_guard.upsert_session(&session)?;
         }
 
+        self.sidebar_statuses
+            .lock()
+            .map_err(|_| "Session status lock poisoned".to_string())?
+            .insert(session.id.clone(), initial_sidebar_status.clone());
+
         let session_id = session.id.clone();
         let exit_session_id = session.id.clone();
         let runtimes = self.runtimes.clone();
         let reader_runtimes = self.runtimes.clone();
+        let sidebar_statuses = self.sidebar_statuses.clone();
         let now = Instant::now();
         let shell_kind = options.shell_kind;
 
@@ -163,6 +175,7 @@ impl SessionManager {
 
         let reader_session_id = session_id.clone();
         let reader_app = app.clone();
+        let reader_statuses = sidebar_statuses.clone();
         thread::spawn(move || {
             let mut buffer = [0_u8; 4096];
             loop {
@@ -170,10 +183,12 @@ impl SessionManager {
                     Ok(0) => break,
                     Ok(read) => {
                         let chunk = String::from_utf8_lossy(&buffer[..read]).to_string();
+                        let mut output_tail = None;
                         if let Ok(mut runtimes) = reader_runtimes.lock() {
                             if let Some(runtime) = runtimes.get_mut(&reader_session_id) {
                                 runtime.last_output_at = Instant::now();
                                 push_output_tail(&mut runtime.output_tail, &chunk);
+                                output_tail = Some(runtime.output_tail.clone());
                                 if let Some(pipe) = runtime.pipe.as_mut() {
                                     if pipe.pipe_output {
                                         if let Some(stdin) = pipe.stdin.as_mut() {
@@ -191,14 +206,23 @@ impl SessionManager {
                                 chunk,
                             },
                         );
+                        if let Some(output_tail) = output_tail {
+                            if let Some(status) =
+                                update_status_from_output(&reader_statuses, &reader_session_id, &output_tail)
+                            {
+                                let _ = reader_app.emit("session-status-changed", status);
+                            }
+                        }
                     }
                     Err(_) => break,
                 }
             }
         });
 
+        let status_app = app.clone();
         let wait_app = app;
         let wait_db = db;
+        let wait_statuses = sidebar_statuses;
         thread::spawn(move || {
             let exit_code = wait_for_exit(child);
             let status = if exit_code == Some(0) {
@@ -208,9 +232,14 @@ impl SessionManager {
             };
 
             if let Ok(db_guard) = wait_db.lock() {
-                let _ = db_guard.update_session_exit(&exit_session_id, status, exit_code);
+                let _ = db_guard.update_session_exit(&exit_session_id, status.clone(), exit_code);
             }
             let _ = runtimes.lock().map(|mut map| map.remove(&exit_session_id));
+            if let Some(next_status) =
+                update_status_state(&wait_statuses, &exit_session_id, status.clone())
+            {
+                let _ = wait_app.emit("session-status-changed", next_status);
+            }
 
             if let Some(state) = wait_app.try_state::<crate::AppState>() {
                 let _ = crate::handle_runtime_session_exit(state.inner(), &exit_session_id);
@@ -221,7 +250,12 @@ impl SessionManager {
                 exit_code,
             };
             let _ = wait_app.emit("session-exit", event);
+            if let Ok(mut statuses) = wait_statuses.lock() {
+                statuses.remove(&exit_session_id);
+            }
         });
+
+        let _ = status_app.emit("session-status-changed", initial_sidebar_status);
 
         Ok(session)
     }
@@ -270,6 +304,10 @@ impl SessionManager {
         let runtime = runtimes
             .remove(session_id)
             .ok_or_else(|| "Session not found".to_string())?;
+        self.sidebar_statuses
+            .lock()
+            .map_err(|_| "Session status lock poisoned".to_string())?
+            .remove(session_id);
         let session_id = session_id.to_string();
         thread::spawn(move || {
             let _ = terminate_runtime(&session_id, runtime);
@@ -367,6 +405,15 @@ impl SessionManager {
                 .map_err(|_| "Session lock poisoned".to_string())?;
             guard.drain().collect::<Vec<_>>()
         };
+        {
+            let mut statuses = self
+                .sidebar_statuses
+                .lock()
+                .map_err(|_| "Session status lock poisoned".to_string())?;
+            for (session_id, _) in &runtimes {
+                statuses.remove(session_id);
+            }
+        }
 
         let mut errors = Vec::new();
         for (session_id, runtime) in runtimes {
@@ -493,6 +540,223 @@ impl SessionManager {
         let separator = if options.join_lines { "" } else { "\n" };
         Ok(lines.join(separator))
     }
+
+    pub fn get_sidebar_status(
+        &self,
+        session: &TerminalSession,
+    ) -> Result<SessionSidebarStatus, String> {
+        let cached = self
+            .sidebar_statuses
+            .lock()
+            .map_err(|_| "Session status lock poisoned".to_string())?
+            .get(&session.id)
+            .cloned();
+        let mut status = cached.unwrap_or_else(|| build_initial_sidebar_status(session));
+        status.state = session.status.clone();
+        Ok(status)
+    }
+}
+
+fn build_initial_sidebar_status(session: &TerminalSession) -> SessionSidebarStatus {
+    SessionSidebarStatus {
+        session_id: session.id.clone(),
+        launch_profile: session.launch_profile.clone(),
+        provider: provider_for_launch_profile(&session.launch_profile),
+        state: session.status.clone(),
+        model_label: None,
+        mode_label: mode_label_for_launch_profile(&session.launch_profile),
+        context_percent: None,
+        usage5h_percent: None,
+        usage5h_reset_at: None,
+        usage7d_percent: None,
+        usage7d_reset_at: None,
+    }
+}
+
+fn provider_for_launch_profile(launch_profile: &LaunchProfile) -> SessionStatusProvider {
+    match launch_profile {
+        LaunchProfile::Terminal => SessionStatusProvider::Terminal,
+        LaunchProfile::Claude | LaunchProfile::ClaudeUnsafe => SessionStatusProvider::Claude,
+        LaunchProfile::Codex | LaunchProfile::CodexFullAuto => SessionStatusProvider::Codex,
+    }
+}
+
+fn mode_label_for_launch_profile(launch_profile: &LaunchProfile) -> Option<String> {
+    match launch_profile {
+        LaunchProfile::Codex => Some("Interactive".to_string()),
+        LaunchProfile::CodexFullAuto => Some("Full Auto".to_string()),
+        LaunchProfile::Terminal | LaunchProfile::Claude | LaunchProfile::ClaudeUnsafe => None,
+    }
+}
+
+fn update_status_state(
+    statuses: &Arc<Mutex<HashMap<String, SessionSidebarStatus>>>,
+    session_id: &str,
+    state: SessionStatus,
+) -> Option<SessionSidebarStatus> {
+    let mut statuses = statuses.lock().ok()?;
+    let status = statuses.get_mut(session_id)?;
+    if status.state == state {
+        return None;
+    }
+    status.state = state;
+    Some(status.clone())
+}
+
+fn update_status_from_output(
+    statuses: &Arc<Mutex<HashMap<String, SessionSidebarStatus>>>,
+    session_id: &str,
+    output_tail: &str,
+) -> Option<SessionSidebarStatus> {
+    let mut statuses = statuses.lock().ok()?;
+    let status = statuses.get_mut(session_id)?;
+    let mut next_status = status.clone();
+    if !apply_output_to_sidebar_status(&mut next_status, output_tail) || *status == next_status {
+        return None;
+    }
+    *status = next_status.clone();
+    Some(next_status)
+}
+
+fn apply_output_to_sidebar_status(status: &mut SessionSidebarStatus, output_tail: &str) -> bool {
+    let clean = strip_ansi(output_tail);
+    match status.provider {
+        SessionStatusProvider::Terminal => false,
+        SessionStatusProvider::Codex => apply_codex_status(status, &clean),
+        SessionStatusProvider::Claude => apply_claude_status(status, &clean),
+    }
+}
+
+fn apply_codex_status(status: &mut SessionSidebarStatus, clean_output: &str) -> bool {
+    let mut changed = false;
+    if let Some(model_label) = extract_field_after_label(clean_output, "model:") {
+        if status.model_label.as_deref() != Some(model_label.as_str()) {
+            status.model_label = Some(model_label);
+            changed = true;
+        }
+    }
+
+    if let Some(context_percent) = extract_percent_before_suffix(clean_output, "% left") {
+        if status.context_percent != Some(context_percent) {
+            status.context_percent = Some(context_percent);
+            changed = true;
+        }
+    }
+
+    changed
+}
+
+fn apply_claude_status(status: &mut SessionSidebarStatus, clean_output: &str) -> bool {
+    let mut changed = false;
+
+    if let Some(model_label) = extract_last_model_token(clean_output, "claude-") {
+        if status.model_label.as_deref() != Some(model_label.as_str()) {
+            status.model_label = Some(model_label);
+            changed = true;
+        }
+    }
+
+    if let Some(context_percent) = extract_context_percent(clean_output) {
+        if status.context_percent != Some(context_percent) {
+            status.context_percent = Some(context_percent);
+            changed = true;
+        }
+    }
+
+    if let Some(usage5h_percent) = extract_percent_after_label(clean_output, "5h") {
+        if status.usage5h_percent != Some(usage5h_percent) {
+            status.usage5h_percent = Some(usage5h_percent);
+            changed = true;
+        }
+    }
+
+    if let Some(usage7d_percent) = extract_percent_after_label(clean_output, "7d") {
+        if status.usage7d_percent != Some(usage7d_percent) {
+            status.usage7d_percent = Some(usage7d_percent);
+            changed = true;
+        }
+    }
+
+    changed
+}
+
+fn extract_field_after_label(clean_output: &str, label: &str) -> Option<String> {
+    clean_output
+        .lines()
+        .rev()
+        .find_map(|line| {
+            let trimmed = line.trim();
+            let lower = trimmed.to_ascii_lowercase();
+            let label_lower = label.to_ascii_lowercase();
+            lower
+                .starts_with(&label_lower)
+                .then(|| trimmed[label.len()..].trim().to_string())
+        })
+        .filter(|value| !value.is_empty())
+}
+
+fn extract_percent_before_suffix(clean_output: &str, suffix: &str) -> Option<u8> {
+    clean_output
+        .match_indices(suffix)
+        .filter_map(|(index, _)| extract_trailing_percent(&clean_output[..index]))
+        .last()
+}
+
+fn extract_percent_after_label(clean_output: &str, label: &str) -> Option<u8> {
+    let lower_label = label.to_ascii_lowercase();
+    clean_output.lines().rev().find_map(|line| {
+        let lower_line = line.to_ascii_lowercase();
+        lower_line
+            .find(&lower_label)
+            .and_then(|start| extract_first_percent(&line[start + label.len()..]))
+    })
+}
+
+fn extract_context_percent(clean_output: &str) -> Option<u8> {
+    clean_output.lines().rev().find_map(|line| {
+        let lower = line.to_ascii_lowercase();
+        if lower.contains("context") {
+            extract_first_percent(line)
+        } else {
+            None
+        }
+    })
+}
+
+fn extract_last_model_token(clean_output: &str, prefix: &str) -> Option<String> {
+    clean_output
+        .split(|ch: char| ch.is_whitespace() || matches!(ch, '"' | '\'' | ',' | '(' | ')' | '[' | ']'))
+        .filter(|token| token.starts_with(prefix))
+        .map(|token| token.trim_end_matches(|ch: char| ".:;!?".contains(ch)).to_string())
+        .last()
+}
+
+fn extract_first_percent(input: &str) -> Option<u8> {
+    let bytes = input.as_bytes();
+    for index in 0..bytes.len() {
+        if bytes[index] == b'%' {
+            if let Some(percent) = extract_trailing_percent(&input[..index]) {
+                return Some(percent);
+            }
+        }
+    }
+    None
+}
+
+fn extract_trailing_percent(input: &str) -> Option<u8> {
+    let digits = input
+        .chars()
+        .rev()
+        .skip_while(|ch| ch.is_whitespace())
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect::<String>();
+    if digits.is_empty() {
+        return None;
+    }
+    digits.parse::<u8>().ok().filter(|value| *value <= 100)
 }
 
 fn wait_for_exit(mut child: Box<dyn Child + Send + Sync>) -> Option<i32> {

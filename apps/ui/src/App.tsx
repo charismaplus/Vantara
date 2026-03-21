@@ -1,14 +1,17 @@
-import type { ReactNode, MouseEvent as ReactMouseEvent } from "react";
+import type { MouseEvent as ReactMouseEvent, PointerEvent as ReactPointerEvent, ReactNode } from "react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Group as PanelGroup, Panel, Separator as PanelResizeHandle } from "react-resizable-panels";
 import type {
   LayoutNode,
   LaunchProfile,
+  PaneMovePlacement,
   Project,
   ProjectWorkspaceSnapshot,
+  SessionSidebarStatus,
   TerminalSession,
   WorkspaceSession,
   WorkspaceSnapshot,
+  WorkspaceWindow,
 } from "../../../packages/contracts/src/index.ts";
 
 import { AppErrorBoundary } from "./components/AppErrorBoundary";
@@ -22,19 +25,23 @@ import {
   createWorkspaceSession,
   deleteProject,
   deleteWorkspaceSession,
+  getSessionSidebarStatus,
   listProjects,
+  movePane,
   openProject,
   openSession,
   renameProject,
   renameWindow,
   renameWorkspaceSession,
   reportTabViewport,
+  setActivePane,
   setActiveWindow,
   splitPane,
 } from "./lib/api";
 import {
   listenSessionExit,
   listenSessionOutput,
+  listenSessionStatusChanged,
   listenWindowFileDrop,
   listenWorkspaceChanged,
   openDirectoryDialog,
@@ -68,6 +75,14 @@ type SidebarContextMenuState =
       x: number;
       y: number;
     };
+
+type PaneMoveMenuState = {
+  paneId: string;
+  x: number;
+  y: number;
+};
+
+type DirectionalPaneMovePlacement = Exclude<PaneMovePlacement, "swap">;
 
 const launcherRows: LauncherProfile[][] = [
   [
@@ -117,6 +132,59 @@ function collectPaneLabels(node: LayoutNode, paneLabels: Map<string, string>) {
   }
 }
 
+function findStackNode(node: LayoutNode, targetId: string): Extract<LayoutNode, { type: "stack" }> | null {
+  if (isStackNode(node)) {
+    return node.id === targetId ? node : null;
+  }
+  for (const child of node.children) {
+    const match = findStackNode(child, targetId);
+    if (match) {
+      return match;
+    }
+  }
+  return null;
+}
+
+function getActiveTerminalForPane(snapshot: WorkspaceSnapshot | null, window: WorkspaceWindow | null) {
+  if (!snapshot || !window) {
+    return null;
+  }
+  const paneId = window.activePaneId ?? null;
+  if (!paneId) {
+    return null;
+  }
+  const stack = findStackNode(window.root, paneId);
+  if (!stack) {
+    return null;
+  }
+  const activeItem = stack.items.find((item) => item.id === stack.activeItemId) ?? stack.items[0];
+  if (!activeItem?.sessionId) {
+    return null;
+  }
+  return snapshot.terminals.find((session) => session.id === activeItem.sessionId) ?? null;
+}
+
+function resolveDropPlacementFromRect(rect: DOMRect, clientX: number, clientY: number): PaneMovePlacement {
+  const x = clientX - rect.left;
+  const y = clientY - rect.top;
+  const horizontalInset = rect.width * 0.24;
+  const verticalInset = rect.height * 0.24;
+
+  if (y <= verticalInset) {
+    return "top";
+  }
+  if (y >= rect.height - verticalInset) {
+    return "bottom";
+  }
+  if (x <= horizontalInset) {
+    return "left";
+  }
+  if (x >= rect.width - horizontalInset) {
+    return "right";
+  }
+  return "swap";
+}
+
 function withTimeout<T>(promise: Promise<T>, timeoutMs: number, timeoutMessage: string) {
   let timeoutId: number | null = null;
   const timeoutPromise = new Promise<T>((_resolve, reject) => {
@@ -136,7 +204,7 @@ function getErrorMessage(error: unknown) {
 export default function App() {
   const [projects, setProjects] = useState<Project[]>([]);
   const [activeProjectId, setActiveProjectId] = useState<string | null>(null);
-  const [projectSnapshot, setProjectSnapshot] = useState<ProjectWorkspaceSnapshot | null>(null);
+  const [projectSnapshotsById, setProjectSnapshotsById] = useState<Record<string, ProjectWorkspaceSnapshot>>({});
   const [activeWorkspaceSessionId, setActiveWorkspaceSessionId] = useState<string | null>(null);
   const [sessionSnapshot, setSessionSnapshot] = useState<WorkspaceSnapshot | null>(null);
   const [expandedProjectIds, setExpandedProjectIds] = useState<Record<string, boolean>>({});
@@ -150,24 +218,44 @@ export default function App() {
   const [renamingProjectId, setRenamingProjectId] = useState<string | null>(null);
   const [renamingProjectName, setRenamingProjectName] = useState("");
   const [pendingDeleteProject, setPendingDeleteProject] = useState<Project | null>(null);
-  const [pendingDeleteSession, setPendingDeleteSession] = useState<WorkspaceSession | null>(null);
+  const [pendingDeleteSession, setPendingDeleteSession] = useState<{ projectId: string; session: WorkspaceSession } | null>(null);
   const [sidebarContextMenu, setSidebarContextMenu] = useState<SidebarContextMenuState | null>(null);
+  const [paneMoveMenu, setPaneMoveMenu] = useState<PaneMoveMenuState | null>(null);
+  const [sidebarStatus, setSidebarStatus] = useState<SessionSidebarStatus | null>(null);
+  const [draggingPaneId, setDraggingPaneId] = useState<string | null>(null);
+  const [dragTarget, setDragTarget] = useState<{ paneId: string; placement: PaneMovePlacement } | null>(null);
   const workspaceCanvasRef = useRef<HTMLElement | null>(null);
   const activeProjectIdRef = useRef<string | null>(null);
   const activeWorkspaceSessionIdRef = useRef<string | null>(null);
+  const activeTerminalSessionIdRef = useRef<string | null>(null);
+  const draggingPaneIdRef = useRef<string | null>(null);
+  const selectionRequestSeqRef = useRef(0);
+  const workspaceMutationSeqRef = useRef(0);
+  const dragPointerIdRef = useRef<number | null>(null);
+  const dragHandleElementRef = useRef<HTMLElement | null>(null);
   const refreshProjectSummaryRef = useRef<(projectId: string) => Promise<void>>(async () => {});
   const refreshCurrentSelectionRef = useRef<() => Promise<void>>(async () => {});
+  const movePaneWithinWindowRef = useRef<(sourcePaneId: string, targetPaneId: string, placement: PaneMovePlacement) => Promise<void>>(async () => {});
 
   const activeProject = useMemo(() => projects.find((entry) => entry.id === activeProjectId) ?? null, [projects, activeProjectId]);
+  const activeProjectSnapshot = useMemo(
+    () => (activeProjectId ? projectSnapshotsById[activeProjectId] ?? null : null),
+    [activeProjectId, projectSnapshotsById],
+  );
   const activeWorkspaceSession = useMemo(
-    () => projectSnapshot?.sessions.find((entry) => entry.id === activeWorkspaceSessionId) ?? null,
-    [projectSnapshot, activeWorkspaceSessionId],
+    () => activeProjectSnapshot?.sessions.find((entry) => entry.id === activeWorkspaceSessionId) ?? null,
+    [activeProjectSnapshot, activeWorkspaceSessionId],
   );
   const sessions = useMemo(() => createSessionMap(sessionSnapshot), [sessionSnapshot]);
   const activeWindow = useMemo(
     () => getActiveTab(sessionSnapshot?.windows ?? [], sessionSnapshot?.activeWindowId),
     [sessionSnapshot],
   );
+  const activeTerminalSession = useMemo(
+    () => getActiveTerminalForPane(sessionSnapshot, activeWindow),
+    [sessionSnapshot, activeWindow],
+  );
+  const activeTerminalSessionId = activeTerminalSession?.id ?? null;
   const paneLabels = useMemo(() => {
     const labels = new Map<string, string>();
     if (activeWindow) {
@@ -185,11 +273,33 @@ export default function App() {
   }, [activeWorkspaceSessionId]);
 
   useEffect(() => {
+    draggingPaneIdRef.current = draggingPaneId;
+  }, [draggingPaneId]);
+
+  useEffect(() => {
+    activeTerminalSessionIdRef.current = activeTerminalSessionId;
+  }, [activeTerminalSessionId]);
+
+  function mergeProjectSnapshot(nextSnapshot: ProjectWorkspaceSnapshot) {
+    setProjectSnapshotsById((current) => ({ ...current, [nextSnapshot.projectId]: nextSnapshot }));
+  }
+
+  function isSelectionRequestCurrent(requestSeq: number, projectId: string, workspaceSessionId: string | null) {
+    return selectionRequestSeqRef.current === requestSeq
+      && activeProjectIdRef.current === projectId
+      && (activeWorkspaceSessionIdRef.current ?? null) === (workspaceSessionId ?? null);
+  }
+
+  useEffect(() => {
     void (async () => {
       try {
         const loadedProjects = await listProjects();
         setProjects(loadedProjects);
         if (loadedProjects[0]) {
+          const projectSnapshots = await Promise.all(
+            loadedProjects.map(async (project) => [project.id, await openProject(project.id)] as const),
+          );
+          setProjectSnapshotsById(Object.fromEntries(projectSnapshots));
           setExpandedProjectIds({ [loadedProjects[0].id]: true });
           setLoading(true);
           activeProjectIdRef.current = loadedProjects[0].id;
@@ -197,8 +307,7 @@ export default function App() {
           setActiveProjectId(loadedProjects[0].id);
           setActiveWorkspaceSessionId(null);
           setSessionSnapshot(null);
-          setProjectSnapshot(await openProject(loadedProjects[0].id));
-          setProjects(await listProjects());
+          setSidebarStatus(null);
           setLoading(false);
         }
       } catch (error) {
@@ -211,7 +320,7 @@ export default function App() {
   async function refreshProjectSummary(projectId: string) {
     try {
       const nextProjectSnapshot = await openProject(projectId);
-      setProjectSnapshot(nextProjectSnapshot);
+      mergeProjectSnapshot(nextProjectSnapshot);
       setProjects(await listProjects());
     } catch (error) {
       showError(error);
@@ -223,27 +332,49 @@ export default function App() {
     if (!projectId) {
       return;
     }
+    const requestSeq = selectionRequestSeqRef.current + 1;
+    selectionRequestSeqRef.current = requestSeq;
+    const expectedWorkspaceSessionId = activeWorkspaceSessionIdRef.current;
 
     setLoading(true);
     try {
-      const nextProjectSnapshot = await openProject(projectId);
-      setProjectSnapshot(nextProjectSnapshot);
-      setProjects(await listProjects());
+      const [nextProjectSnapshot, nextProjects] = await Promise.all([
+        openProject(projectId),
+        listProjects(),
+      ]);
+      if (!isSelectionRequestCurrent(requestSeq, projectId, expectedWorkspaceSessionId)) {
+        return;
+      }
+      mergeProjectSnapshot(nextProjectSnapshot);
+      setProjects(nextProjects);
 
-      const workspaceSessionId = activeWorkspaceSessionIdRef.current;
-      if (workspaceSessionId && nextProjectSnapshot.sessions.some((entry) => entry.id === workspaceSessionId)) {
-        setSessionSnapshot(await openSession(projectId, workspaceSessionId));
+      if (
+        expectedWorkspaceSessionId
+        && nextProjectSnapshot.sessions.some((entry) => entry.id === expectedWorkspaceSessionId)
+      ) {
+        const nextSessionSnapshot = await openSession(projectId, expectedWorkspaceSessionId);
+        if (!isSelectionRequestCurrent(requestSeq, projectId, expectedWorkspaceSessionId)) {
+          return;
+        }
+        setSessionSnapshot(nextSessionSnapshot);
       } else {
-        if (workspaceSessionId) {
+        if (!isSelectionRequestCurrent(requestSeq, projectId, expectedWorkspaceSessionId)) {
+          return;
+        }
+        if (expectedWorkspaceSessionId) {
           activeWorkspaceSessionIdRef.current = null;
           setActiveWorkspaceSessionId(null);
         }
         setSessionSnapshot(null);
       }
     } catch (error) {
-      showError(error);
+      if (selectionRequestSeqRef.current === requestSeq) {
+        showError(error);
+      }
     } finally {
-      setLoading(false);
+      if (selectionRequestSeqRef.current === requestSeq) {
+        setLoading(false);
+      }
     }
   }
 
@@ -255,6 +386,7 @@ export default function App() {
     let outputDispose: (() => void) | null = null;
     let exitDispose: (() => void) | null = null;
     let workspaceDispose: (() => void) | null = null;
+    let statusDispose: (() => void) | null = null;
 
     const bindListener = (
       promise: Promise<() => void>,
@@ -289,15 +421,10 @@ export default function App() {
 
     bindListener(
       listenWorkspaceChanged((event) => {
-        const projectId = activeProjectIdRef.current;
-        const workspaceSessionId = activeWorkspaceSessionIdRef.current;
+        void refreshProjectSummaryRef.current(event.payload.projectId);
 
-        if (!projectId || event.payload.projectId !== projectId) {
-          return;
-        }
-
-        if (event.payload.sessionId && workspaceSessionId && event.payload.sessionId !== workspaceSessionId) {
-          void refreshProjectSummaryRef.current(projectId);
+        const activeProjectId = activeProjectIdRef.current;
+        if (!activeProjectId || event.payload.projectId !== activeProjectId) {
           return;
         }
 
@@ -308,11 +435,23 @@ export default function App() {
       },
     );
 
+    bindListener(
+      listenSessionStatusChanged((event) => {
+        if (event.payload.sessionId === activeTerminalSessionIdRef.current) {
+          setSidebarStatus(event.payload);
+        }
+      }),
+      (dispose) => {
+        statusDispose = dispose;
+      },
+    );
+
     return () => {
       disposed = true;
       outputDispose?.();
       exitDispose?.();
       workspaceDispose?.();
+      statusDispose?.();
     };
   }, []);
 
@@ -349,6 +488,30 @@ export default function App() {
       }
     };
   }, [activeProjectId, activeWindow]);
+
+  useEffect(() => {
+    if (!activeTerminalSessionId) {
+      setSidebarStatus(null);
+      return;
+    }
+
+    let cancelled = false;
+    void getSessionSidebarStatus(activeTerminalSessionId)
+      .then((status) => {
+        if (!cancelled) {
+          setSidebarStatus(status);
+        }
+      })
+      .catch((error) => {
+        if (!cancelled) {
+          showError(error);
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [activeTerminalSessionId]);
 
   useEffect(() => {
     let disposed = false;
@@ -405,42 +568,183 @@ export default function App() {
     };
   }, [sidebarContextMenu]);
 
+  useEffect(() => {
+    if (!paneMoveMenu) {
+      return;
+    }
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setPaneMoveMenu(null);
+      }
+    };
+
+    const handleWindowBlur = () => {
+      setPaneMoveMenu(null);
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+    window.addEventListener("blur", handleWindowBlur);
+
+    return () => {
+      window.removeEventListener("keydown", handleKeyDown);
+      window.removeEventListener("blur", handleWindowBlur);
+    };
+  }, [paneMoveMenu]);
+
+  useEffect(() => {
+    if (!draggingPaneId) {
+      return;
+    }
+    const pointerId = dragPointerIdRef.current;
+
+    const getCurrentDropTarget = (clientX: number, clientY: number) =>
+      getPaneDropTargetFromPoint(clientX, clientY, draggingPaneId);
+
+    const handlePointerMove = (event: PointerEvent) => {
+      if (!isPointerMatch(event)) {
+        return;
+      }
+      const nextTarget = getCurrentDropTarget(event.clientX, event.clientY);
+      setDragTarget((current) => {
+        if (!nextTarget) {
+          return null;
+        }
+        if (current?.paneId === nextTarget.paneId && current.placement === nextTarget.placement) {
+          return current;
+        }
+        return nextTarget;
+      });
+    };
+
+    const clearPointerDragState = () => {
+      const dragHandle = dragHandleElementRef.current;
+      const activePointerId = dragPointerIdRef.current;
+      if (dragHandle && activePointerId !== null) {
+        try {
+          if (dragHandle.hasPointerCapture(activePointerId)) {
+            dragHandle.releasePointerCapture(activePointerId);
+          }
+        } catch {
+          // no-op: release may fail when capture is already gone.
+        }
+      }
+      dragHandleElementRef.current = null;
+      dragPointerIdRef.current = null;
+      setDraggingPaneId(null);
+      setDragTarget(null);
+    };
+
+    const isPointerMatch = (event: PointerEvent) => pointerId === null || event.pointerId === pointerId;
+
+    const handlePointerUp = (event: PointerEvent) => {
+      if (!isPointerMatch(event)) {
+        return;
+      }
+      const finalTarget = getCurrentDropTarget(event.clientX, event.clientY);
+      const sourcePaneId = draggingPaneIdRef.current;
+      clearPointerDragState();
+      if (!sourcePaneId || !finalTarget) {
+        return;
+      }
+      void movePaneWithinWindowRef.current(sourcePaneId, finalTarget.paneId, finalTarget.placement).catch(showError);
+    };
+
+    const handlePointerCancel = (event: PointerEvent) => {
+      if (!isPointerMatch(event)) {
+        return;
+      }
+      clearPointerDragState();
+    };
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") {
+        return;
+      }
+      event.preventDefault();
+      clearPointerDragState();
+    };
+
+    const handleWindowBlur = () => {
+      clearPointerDragState();
+    };
+
+    window.addEventListener("pointermove", handlePointerMove);
+    window.addEventListener("pointerup", handlePointerUp);
+    window.addEventListener("pointercancel", handlePointerCancel);
+    window.addEventListener("keydown", handleKeyDown);
+    window.addEventListener("blur", handleWindowBlur);
+
+    return () => {
+      window.removeEventListener("pointermove", handlePointerMove);
+      window.removeEventListener("pointerup", handlePointerUp);
+      window.removeEventListener("pointercancel", handlePointerCancel);
+      window.removeEventListener("keydown", handleKeyDown);
+      window.removeEventListener("blur", handleWindowBlur);
+    };
+  }, [draggingPaneId]);
+
   async function refreshProjectOnly(projectId: string) {
     const nextProjectSnapshot = await openProject(projectId);
-    setProjectSnapshot(nextProjectSnapshot);
+    mergeProjectSnapshot(nextProjectSnapshot);
     const nextProjects = await listProjects();
     setProjects(nextProjects);
-    if (activeWorkspaceSessionId && !nextProjectSnapshot.sessions.some((entry) => entry.id === activeWorkspaceSessionId)) {
+    const activeProjectId = activeProjectIdRef.current;
+    const activeWorkspaceSessionId = activeWorkspaceSessionIdRef.current;
+    if (
+      projectId === activeProjectId
+      && activeWorkspaceSessionId
+      && !nextProjectSnapshot.sessions.some((entry) => entry.id === activeWorkspaceSessionId)
+    ) {
       activeWorkspaceSessionIdRef.current = null;
       setActiveWorkspaceSessionId(null);
       setSessionSnapshot(null);
+      setSidebarStatus(null);
     }
   }
 
   async function selectProject(projectId: string) {
+    const requestSeq = selectionRequestSeqRef.current + 1;
+    selectionRequestSeqRef.current = requestSeq;
     setLoading(true);
     setErrorMessage(null);
     setSidebarContextMenu(null);
+    setPaneMoveMenu(null);
     try {
       activeProjectIdRef.current = projectId;
       activeWorkspaceSessionIdRef.current = null;
       setActiveProjectId(projectId);
       setActiveWorkspaceSessionId(null);
       setSessionSnapshot(null);
+      setSidebarStatus(null);
       setExpandedProjectIds((current) => ({ ...current, [projectId]: true }));
-      setProjectSnapshot(await openProject(projectId));
-      setProjects(await listProjects());
+      const [nextProjectSnapshot, nextProjects] = await Promise.all([
+        openProject(projectId),
+        listProjects(),
+      ]);
+      if (!isSelectionRequestCurrent(requestSeq, projectId, null)) {
+        return;
+      }
+      mergeProjectSnapshot(nextProjectSnapshot);
+      setProjects(nextProjects);
     } catch (error) {
-      showError(error);
+      if (selectionRequestSeqRef.current === requestSeq) {
+        showError(error);
+      }
     } finally {
-      setLoading(false);
+      if (selectionRequestSeqRef.current === requestSeq) {
+        setLoading(false);
+      }
     }
   }
 
   async function selectWorkspaceSession(projectId: string, workspaceSessionId: string) {
+    const requestSeq = selectionRequestSeqRef.current + 1;
+    selectionRequestSeqRef.current = requestSeq;
     setLoading(true);
     setErrorMessage(null);
     setSidebarContextMenu(null);
+    setPaneMoveMenu(null);
     try {
       activeProjectIdRef.current = projectId;
       activeWorkspaceSessionIdRef.current = workspaceSessionId;
@@ -452,26 +756,56 @@ export default function App() {
         openSession(projectId, workspaceSessionId),
         listProjects(),
       ]);
-      setProjectSnapshot(nextProjectSnapshot);
+      if (!isSelectionRequestCurrent(requestSeq, projectId, workspaceSessionId)) {
+        return;
+      }
+      mergeProjectSnapshot(nextProjectSnapshot);
       setSessionSnapshot(nextSessionSnapshot);
       setProjects(nextProjects);
     } catch (error) {
-      showError(error);
+      if (selectionRequestSeqRef.current === requestSeq) {
+        showError(error);
+      }
     } finally {
-      setLoading(false);
+      if (selectionRequestSeqRef.current === requestSeq) {
+        setLoading(false);
+      }
     }
   }
 
   async function refreshSessionSnapshot(promise: Promise<WorkspaceSnapshot>) {
+    const mutationSeq = workspaceMutationSeqRef.current + 1;
+    workspaceMutationSeqRef.current = mutationSeq;
+    const expectedProjectId = activeProjectIdRef.current;
+    const expectedWorkspaceSessionId = activeWorkspaceSessionIdRef.current;
     try {
       setErrorMessage(null);
       const nextSnapshot = await promise;
+      if (workspaceMutationSeqRef.current !== mutationSeq) {
+        return;
+      }
+      if (
+        expectedProjectId !== activeProjectIdRef.current
+        || expectedWorkspaceSessionId !== activeWorkspaceSessionIdRef.current
+      ) {
+        return;
+      }
       setSessionSnapshot(nextSnapshot);
-      if (activeProjectId) {
-        setProjectSnapshot(await openProject(activeProjectId));
+      if (expectedProjectId) {
+        const nextProjectSnapshot = await openProject(expectedProjectId);
+        if (
+          workspaceMutationSeqRef.current !== mutationSeq
+          || expectedProjectId !== activeProjectIdRef.current
+          || expectedWorkspaceSessionId !== activeWorkspaceSessionIdRef.current
+        ) {
+          return;
+        }
+        mergeProjectSnapshot(nextProjectSnapshot);
       }
     } catch (error) {
-      showError(error);
+      if (workspaceMutationSeqRef.current === mutationSeq) {
+        showError(error);
+      }
     }
   }
 
@@ -538,6 +872,7 @@ export default function App() {
 
   function openProjectContextMenu(event: ReactMouseEvent<HTMLElement>, project: Project) {
     event.preventDefault();
+    setPaneMoveMenu(null);
     const position = resolveContextMenuPosition(event.clientX, event.clientY);
     setSidebarContextMenu({
       kind: "project",
@@ -549,6 +884,7 @@ export default function App() {
 
   function openSessionContextMenu(event: ReactMouseEvent<HTMLElement>, project: Project, session: WorkspaceSession) {
     event.preventDefault();
+    setPaneMoveMenu(null);
     const position = resolveContextMenuPosition(event.clientX, event.clientY);
     setSidebarContextMenu({
       kind: "session",
@@ -576,6 +912,144 @@ export default function App() {
   async function createAndOpenSession(projectId: string) {
     const session = await createWorkspaceSession(projectId);
     await selectWorkspaceSession(projectId, session.id);
+  }
+
+  async function activatePane(paneId: string) {
+    if (!activeProjectId || !activeWorkspaceSessionId || !activeWindow) {
+      return;
+    }
+    if (activeWindow.activePaneId === paneId) {
+      return;
+    }
+    await refreshSessionSnapshot(setActivePane(activeProjectId, activeWorkspaceSessionId, activeWindow.id, paneId));
+  }
+
+  async function movePaneWithinWindow(sourcePaneId: string, targetPaneId: string, placement: PaneMovePlacement) {
+    if (!activeProjectId || !activeWorkspaceSessionId || !activeWindow) {
+      return;
+    }
+    await refreshSessionSnapshot(
+      movePane(activeProjectId, activeWorkspaceSessionId, activeWindow.id, sourcePaneId, targetPaneId, placement),
+    );
+  }
+
+  movePaneWithinWindowRef.current = movePaneWithinWindow;
+
+  function getPaneDropTargetFromPoint(clientX: number, clientY: number, sourcePaneId: string) {
+    const target = document.elementFromPoint(clientX, clientY);
+    const paneElement = target instanceof HTMLElement ? target.closest<HTMLElement>("[data-pane-id]") : null;
+    const paneId = paneElement?.dataset.paneId;
+    if (!paneElement || !paneId || paneId === sourcePaneId) {
+      return null;
+    }
+    return {
+      paneId,
+      placement: resolveDropPlacementFromRect(paneElement.getBoundingClientRect(), clientX, clientY),
+    };
+  }
+
+  function beginPaneDrag(event: ReactPointerEvent<HTMLElement>, paneId: string) {
+    event.preventDefault();
+    event.stopPropagation();
+    const previousHandle = dragHandleElementRef.current;
+    const previousPointerId = dragPointerIdRef.current;
+    if (previousHandle && previousPointerId !== null) {
+      try {
+        if (previousHandle.hasPointerCapture(previousPointerId)) {
+          previousHandle.releasePointerCapture(previousPointerId);
+        }
+      } catch {
+        // ignore stale pointer capture release errors
+      }
+    }
+    dragHandleElementRef.current = event.currentTarget;
+    dragPointerIdRef.current = event.pointerId;
+    try {
+      event.currentTarget.setPointerCapture(event.pointerId);
+    } catch {
+      // Some platforms may reject capture when pointer state changed.
+    }
+    setPaneMoveMenu(null);
+    setDraggingPaneId(paneId);
+    setDragTarget(null);
+  }
+
+  function openPaneMoveMenu(event: ReactMouseEvent<HTMLElement>, paneId: string) {
+    event.preventDefault();
+    event.stopPropagation();
+    const position = resolveContextMenuPosition(event.clientX, event.clientY);
+    setSidebarContextMenu(null);
+    setPaneMoveMenu({
+      paneId,
+      x: position.x,
+      y: position.y,
+    });
+  }
+
+  function findDirectionalPaneTarget(sourcePaneId: string, placement: DirectionalPaneMovePlacement) {
+    const sourceElement = Array.from(document.querySelectorAll<HTMLElement>("[data-pane-id]"))
+      .find((element) => element.dataset.paneId === sourcePaneId);
+    if (!sourceElement) {
+      return null;
+    }
+
+    const sourceRect = sourceElement.getBoundingClientRect();
+    const sourceCenterX = sourceRect.left + sourceRect.width / 2;
+    const sourceCenterY = sourceRect.top + sourceRect.height / 2;
+    const paneElements = Array.from(document.querySelectorAll<HTMLElement>("[data-pane-id]"))
+      .filter((element) => element.dataset.paneId && element.dataset.paneId !== sourcePaneId);
+
+    let bestMatch: { paneId: string; score: number } | null = null;
+
+    for (const paneElement of paneElements) {
+      const paneId = paneElement.dataset.paneId;
+      if (!paneId) {
+        continue;
+      }
+      const rect = paneElement.getBoundingClientRect();
+      const centerX = rect.left + rect.width / 2;
+      const centerY = rect.top + rect.height / 2;
+      const deltaX = centerX - sourceCenterX;
+      const deltaY = centerY - sourceCenterY;
+
+      let primaryDistance: number | null = null;
+      let secondaryDistance = 0;
+
+      if (placement === "left" && deltaX < -4) {
+        primaryDistance = Math.abs(deltaX);
+        secondaryDistance = Math.abs(deltaY);
+      } else if (placement === "right" && deltaX > 4) {
+        primaryDistance = Math.abs(deltaX);
+        secondaryDistance = Math.abs(deltaY);
+      } else if (placement === "top" && deltaY < -4) {
+        primaryDistance = Math.abs(deltaY);
+        secondaryDistance = Math.abs(deltaX);
+      } else if (placement === "bottom" && deltaY > 4) {
+        primaryDistance = Math.abs(deltaY);
+        secondaryDistance = Math.abs(deltaX);
+      }
+
+      if (primaryDistance === null) {
+        continue;
+      }
+
+      const score = primaryDistance * 1000 + secondaryDistance;
+      if (!bestMatch || score < bestMatch.score) {
+        bestMatch = { paneId, score };
+      }
+    }
+
+    return bestMatch?.paneId ?? null;
+  }
+
+  async function handlePaneMoveMenuAction(sourcePaneId: string, placement: DirectionalPaneMovePlacement) {
+    setPaneMoveMenu(null);
+    const targetPaneId = findDirectionalPaneTarget(sourcePaneId, placement);
+    if (!targetPaneId) {
+      showError(new Error(`No pane available to move ${placement}.`));
+      return;
+    }
+    await movePaneWithinWindow(sourcePaneId, targetPaneId, placement);
   }
 
   async function handleProjectContextAction(action: "rename" | "delete", project: Project) {
@@ -607,7 +1081,7 @@ export default function App() {
       }
       return;
     }
-    setPendingDeleteSession(session);
+    setPendingDeleteSession({ projectId: project.id, session });
   }
 
   function renderLauncherSurface(onLaunch: (profile: LauncherProfile) => void) {
@@ -662,11 +1136,31 @@ export default function App() {
     const session = activeItem?.sessionId ? sessions.get(activeItem.sessionId) : undefined;
     const sourcePaneLabel = node.sourcePaneId ? paneLabels.get(node.sourcePaneId) : null;
     const originLabel = node.createdBy === "ai" ? (sourcePaneLabel ? `AI from ${sourcePaneLabel}` : "AI") : null;
+    const isActivePane = activeWindow?.activePaneId === node.id;
+    const showDropOverlay = Boolean(draggingPaneId && draggingPaneId !== node.id);
+    const dropPlacement = dragTarget?.paneId === node.id ? dragTarget.placement : null;
 
     return (
-      <div className={`stack-pane ${node.createdBy === "ai" ? "ai-pane" : "user-pane"}`}>
+      <div
+        data-pane-id={node.id}
+        className={`stack-pane ${node.createdBy === "ai" ? "ai-pane" : "user-pane"} ${isActivePane ? "active" : ""} ${draggingPaneId === node.id ? "drag-source" : ""}`}
+        onMouseDown={() => {
+          setPaneMoveMenu(null);
+          void activatePane(node.id).catch(showError);
+        }}
+      >
         <div className="stack-toolbar">
           <div className="stack-primary">
+            <button
+              className="pane-drag-handle"
+              title="Drag to move pane"
+              aria-label={`Move ${node.paneLabel}`}
+              onMouseDown={(event) => event.stopPropagation()}
+              onPointerDown={(event) => beginPaneDrag(event, node.id)}
+              onClick={(event) => event.stopPropagation()}
+            >
+              ::
+            </button>
             <span className={`pane-badge ${node.createdBy === "ai" ? "ai" : "user"}`}>{node.paneLabel}</span>
             {originLabel ? <span className="pane-origin">{originLabel}</span> : null}
             <div className="pane-label" title={activeItem?.title ?? "Pane"}>{activeItem?.title ?? "Pane"}</div>
@@ -675,12 +1169,33 @@ export default function App() {
             {session ? <span className={`status-pill toolbar-status ${session.status}`}>{session.status}</span> : null}
             <button className="toolbar-button" title="Split Up/Down" onClick={() => activeProjectId && activeWorkspaceSessionId && activeWindow && void refreshSessionSnapshot(splitPane(activeProjectId, activeWorkspaceSessionId, activeWindow.id, node.id, "vertical"))}>━</button>
             <button className="toolbar-button" title="Split Left/Right" onClick={() => activeProjectId && activeWorkspaceSessionId && activeWindow && void refreshSessionSnapshot(splitPane(activeProjectId, activeWorkspaceSessionId, activeWindow.id, node.id, "horizontal"))}>┃</button>
+            <button
+              className="toolbar-button"
+              title="Move Pane"
+              onMouseDown={(event) => event.stopPropagation()}
+              onClick={(event) => openPaneMoveMenu(event, node.id)}
+            >
+              Move
+            </button>
             {canClosePane ? <button className="toolbar-button subtle" onClick={() => activeProjectId && activeWorkspaceSessionId && activeWindow && void refreshSessionSnapshot(closePane(activeProjectId, activeWorkspaceSessionId, activeWindow.id, node.id))}>Close Pane</button> : null}
           </div>
         </div>
         <div className="stack-body">
+          {showDropOverlay ? (
+            <div className="pane-drop-overlay" aria-hidden>
+              <span className={`pane-drop-zone top ${dropPlacement === "top" ? "active" : ""}`} />
+              <span className={`pane-drop-zone left ${dropPlacement === "left" ? "active" : ""}`} />
+              <span className={`pane-drop-zone center ${dropPlacement === "swap" ? "active" : ""}`} />
+              <span className={`pane-drop-zone right ${dropPlacement === "right" ? "active" : ""}`} />
+              <span className={`pane-drop-zone bottom ${dropPlacement === "bottom" ? "active" : ""}`} />
+            </div>
+          ) : null}
           {session && session.status === "running" ? (
-            <TerminalView sessionId={session.id} variant={node.createdBy === "ai" ? "ai" : "user"} />
+            <TerminalView
+              sessionId={session.id}
+              variant={node.createdBy === "ai" ? "ai" : "user"}
+              onActivate={() => void activatePane(node.id).catch(showError)}
+            />
           ) : node.createdBy === "user" && node.launchState === "unlaunched" ? (
             renderLauncherSurface((profile) => launchFromPane(node.id, profile))
           ) : session ? (
@@ -731,7 +1246,7 @@ export default function App() {
           {errorMessage ? <div className="error-banner">{errorMessage}</div> : null}
           <div className="sidebar-tree">
             {projects.map((project) => {
-              const projectSessions = projectSnapshot?.projectId === project.id ? projectSnapshot.sessions : [];
+              const projectSessions = projectSnapshotsById[project.id]?.sessions ?? [];
               return (
                 <div key={project.id} className={`tree-group ${project.id === activeProjectId ? "active" : ""}`}>
                   {renamingProjectId === project.id ? (
@@ -816,6 +1331,44 @@ export default function App() {
               );
             })}
           </div>
+          <div className="sidebar-status-panel">
+            <div className="sidebar-status-header">
+              <p className="eyebrow">Active Pane</p>
+              <span className={`status-pill ${sidebarStatus?.state ?? "exited"}`}>
+                {activeTerminalSession ? (sidebarStatus?.state ?? activeTerminalSession.status) : activeWorkspaceSession ? "idle" : "none"}
+              </span>
+            </div>
+            {activeTerminalSession && sidebarStatus ? (
+              <>
+                <div className="sidebar-status-primary">
+                  <span className={`sidebar-provider-badge ${sidebarStatus.provider}`}>
+                    {sidebarStatus.provider === "claude" ? "Claude" : sidebarStatus.provider === "codex" ? "Codex" : "Terminal"}
+                  </span>
+                  {sidebarStatus.modelLabel ? <strong>{sidebarStatus.modelLabel}</strong> : <strong>{activeTerminalSession.title}</strong>}
+                </div>
+                <div className="sidebar-status-chips">
+                  {sidebarStatus.modeLabel ? <span className="sidebar-status-chip">{sidebarStatus.modeLabel}</span> : null}
+                  {sidebarStatus.contextPercent !== null && sidebarStatus.contextPercent !== undefined ? <span className="sidebar-status-chip">{`Context ${sidebarStatus.contextPercent}%`}</span> : null}
+                  {sidebarStatus.usage5hPercent !== null && sidebarStatus.usage5hPercent !== undefined ? <span className="sidebar-status-chip">{`5h ${sidebarStatus.usage5hPercent}%`}</span> : null}
+                  {sidebarStatus.usage7dPercent !== null && sidebarStatus.usage7dPercent !== undefined ? <span className="sidebar-status-chip">{`7d ${sidebarStatus.usage7dPercent}%`}</span> : null}
+                </div>
+                <div className="sidebar-status-foot">
+                  <span>{activeWorkspaceSession?.name ?? "Session"}</span>
+                  <span>{activeWindow?.title ?? "Window"}</span>
+                </div>
+              </>
+            ) : activeWorkspaceSession ? (
+              <div className="sidebar-status-empty">
+                <strong>Idle</strong>
+                <span>Select or launch a terminal in the active pane.</span>
+              </div>
+            ) : (
+              <div className="sidebar-status-empty">
+                <strong>No active session</strong>
+                <span>Open a session to see provider, model, and runtime status.</span>
+              </div>
+            )}
+          </div>
         </aside>
 
         <main className="workspace">
@@ -839,7 +1392,7 @@ export default function App() {
                   </button>
                 ))}
               </div>
-              <section className="workspace-canvas" ref={workspaceCanvasRef} onDragOver={(event) => event.preventDefault()} onDrop={(event) => event.preventDefault()}>
+              <section className="workspace-canvas" ref={workspaceCanvasRef}>
                 {loading ? <div className="empty-state">Loading workspace...</div> : activeWindow ? renderNode(activeWindow.root, false) : <div className="empty-state">Preparing session window...</div>}
               </section>
             </>
@@ -847,7 +1400,7 @@ export default function App() {
             <section className="workspace-canvas">
               {loading ? <div className="empty-state">Loading project...</div> : activeProject ? (
                 <div className="project-list">
-                  {(projectSnapshot?.sessions ?? []).map((session) => (
+                  {(activeProjectSnapshot?.sessions ?? []).map((session) => (
                     <div key={session.id} className="session-list-card">
                       <button className="session-list-card-main" onClick={() => void selectWorkspaceSession(activeProject.id, session.id)}>
                         <div className="session-list-card-content">
@@ -870,9 +1423,25 @@ export default function App() {
 
         {isProjectModalOpen ? <div className="modal-backdrop" onClick={(event) => event.target === event.currentTarget && setIsProjectModalOpen(false)}><div className="modal-card"><div className="modal-header"><div><p className="eyebrow">New Project</p><h3>Add a local workspace</h3></div><button className="toolbar-button" onClick={() => setIsProjectModalOpen(false)}>Close</button></div><div className="project-form modal-form"><input placeholder="Project name" value={newProjectName} onChange={(event) => setNewProjectName(event.target.value)} autoFocus /><div className="path-field"><input placeholder="Absolute path" value={newProjectPath} onChange={(event) => setNewProjectPath(event.target.value)} /><button className="toolbar-button" onClick={() => void browseForProjectPath()}>Browse</button></div><div className="modal-actions"><button className="toolbar-button" onClick={() => setIsProjectModalOpen(false)}>Cancel</button><button className="toolbar-button primary" onClick={() => void submitProject()}>Add Project</button></div></div></div></div> : null}
 
-        {pendingDeleteProject ? <div className="modal-backdrop" onClick={(event) => event.target === event.currentTarget && setPendingDeleteProject(null)}><div className="modal-card modal-card-compact"><div className="modal-header"><div><p className="eyebrow">Remove Project</p><h3>{pendingDeleteProject.name}</h3></div><button className="toolbar-button" onClick={() => setPendingDeleteProject(null)}>Close</button></div><p className="modal-copy">This removes the project from Vantara only. The actual folder stays on disk.</p><div className="modal-actions"><button className="toolbar-button" onClick={() => setPendingDeleteProject(null)}>Cancel</button><button className="toolbar-button subtle" onClick={() => deleteProject(pendingDeleteProject.id).then(async (result) => { setPendingDeleteProject(null); const nextProjects = await listProjects(); setProjects(nextProjects); if (result.nextProjectId) { await selectProject(result.nextProjectId); } else { activeProjectIdRef.current = null; activeWorkspaceSessionIdRef.current = null; setActiveProjectId(null); setProjectSnapshot(null); setActiveWorkspaceSessionId(null); setSessionSnapshot(null); } }).catch(showError)}>Delete Project</button></div></div></div> : null}
+        {pendingDeleteProject ? <div className="modal-backdrop" onClick={(event) => event.target === event.currentTarget && setPendingDeleteProject(null)}><div className="modal-card modal-card-compact"><div className="modal-header"><div><p className="eyebrow">Remove Project</p><h3>{pendingDeleteProject.name}</h3></div><button className="toolbar-button" onClick={() => setPendingDeleteProject(null)}>Close</button></div><p className="modal-copy">This removes the project from Vantara only. The actual folder stays on disk.</p><div className="modal-actions"><button className="toolbar-button" onClick={() => setPendingDeleteProject(null)}>Cancel</button><button className="toolbar-button subtle" onClick={() => { const projectToDelete = pendingDeleteProject; void deleteProject(projectToDelete.id).then(async (result) => { setPendingDeleteProject(null); const nextProjects = await listProjects(); setProjects(nextProjects); setProjectSnapshotsById((current) => { const next = { ...current }; delete next[projectToDelete.id]; return next; }); if (activeProjectId === projectToDelete.id) { if (result.nextProjectId) { await selectProject(result.nextProjectId); } else { activeProjectIdRef.current = null; activeWorkspaceSessionIdRef.current = null; activeTerminalSessionIdRef.current = null; setActiveProjectId(null); setActiveWorkspaceSessionId(null); setSessionSnapshot(null); setSidebarStatus(null); } } }).catch(showError); }}>Delete Project</button></div></div></div> : null}
 
-        {pendingDeleteSession && activeProjectId ? <div className="modal-backdrop" onClick={(event) => event.target === event.currentTarget && setPendingDeleteSession(null)}><div className="modal-card modal-card-compact"><div className="modal-header"><div><p className="eyebrow">Remove Session</p><h3>{pendingDeleteSession.name}</h3></div><button className="toolbar-button" onClick={() => setPendingDeleteSession(null)}>Close</button></div><p className="modal-copy">This removes the session node and its runtime terminals. The project remains intact.</p><div className="modal-actions"><button className="toolbar-button" onClick={() => setPendingDeleteSession(null)}>Cancel</button><button className="toolbar-button subtle" onClick={() => deleteWorkspaceSession(activeProjectId, pendingDeleteSession.id).then((nextSnapshot) => { setPendingDeleteSession(null); setProjectSnapshot(nextSnapshot); if (activeWorkspaceSessionId === pendingDeleteSession.id) { activeWorkspaceSessionIdRef.current = null; setActiveWorkspaceSessionId(null); setSessionSnapshot(null); } }).catch(showError)}>Delete Session</button></div></div></div> : null}
+        {pendingDeleteSession ? <div className="modal-backdrop" onClick={(event) => event.target === event.currentTarget && setPendingDeleteSession(null)}><div className="modal-card modal-card-compact"><div className="modal-header"><div><p className="eyebrow">Remove Session</p><h3>{pendingDeleteSession.session.name}</h3></div><button className="toolbar-button" onClick={() => setPendingDeleteSession(null)}>Close</button></div><p className="modal-copy">This removes the session node and its runtime terminals. The project remains intact.</p><div className="modal-actions"><button className="toolbar-button" onClick={() => setPendingDeleteSession(null)}>Cancel</button><button className="toolbar-button subtle" onClick={() => { const sessionToDelete = pendingDeleteSession; void deleteWorkspaceSession(sessionToDelete.projectId, sessionToDelete.session.id).then((nextSnapshot) => { setPendingDeleteSession(null); mergeProjectSnapshot(nextSnapshot); if (activeProjectId === sessionToDelete.projectId && activeWorkspaceSessionId === sessionToDelete.session.id) { activeWorkspaceSessionIdRef.current = null; activeTerminalSessionIdRef.current = null; setActiveWorkspaceSessionId(null); setSessionSnapshot(null); setSidebarStatus(null); } }).catch(showError); }}>Delete Session</button></div></div></div> : null}
+
+        {paneMoveMenu ? (
+          <div className="context-menu-layer" onClick={() => setPaneMoveMenu(null)} onContextMenu={(event) => event.preventDefault()}>
+            <div
+              className="context-menu"
+              style={{ left: paneMoveMenu.x, top: paneMoveMenu.y }}
+              onClick={(event) => event.stopPropagation()}
+              onContextMenu={(event) => event.preventDefault()}
+            >
+              <button className="context-menu-item" onClick={() => void handlePaneMoveMenuAction(paneMoveMenu.paneId, "left").catch(showError)}>Move Left</button>
+              <button className="context-menu-item" onClick={() => void handlePaneMoveMenuAction(paneMoveMenu.paneId, "right").catch(showError)}>Move Right</button>
+              <button className="context-menu-item" onClick={() => void handlePaneMoveMenuAction(paneMoveMenu.paneId, "top").catch(showError)}>Move Up</button>
+              <button className="context-menu-item" onClick={() => void handlePaneMoveMenuAction(paneMoveMenu.paneId, "bottom").catch(showError)}>Move Down</button>
+            </div>
+          </div>
+        ) : null}
 
         {sidebarContextMenu ? (
           <div className="context-menu-layer" onClick={() => setSidebarContextMenu(null)} onContextMenu={(event) => event.preventDefault()}>

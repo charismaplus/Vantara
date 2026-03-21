@@ -29,8 +29,8 @@ use layout::{
 };
 use models::{
     DeleteProjectResult, LaunchProfile, PaneCreatedBy, Project, ProjectWorkspaceSnapshot,
-    SessionStatus, TerminalSession, WorkspaceChangedEvent, WorkspaceSession,
-    WorkspaceSessionCreatedBy, WorkspaceSnapshot, WorkspaceTab,
+    SessionSidebarStatus, SessionStatus, TerminalSession, WorkspaceChangedEvent,
+    WorkspaceSession, WorkspaceSessionCreatedBy, WorkspaceSnapshot, WorkspaceTab,
 };
 use serde::{Deserialize, Serialize};
 use sessions::{
@@ -1012,11 +1012,71 @@ fn create_window(
     title: Option<String>,
 ) -> Result<WorkspaceSnapshot, String> {
     let mut snapshot = load_workspace_session_snapshot(&state, &project_id, &workspace_session_id)?;
+    create_window_in_snapshot(&mut snapshot, title);
+    persist_workspace_snapshot(&state, snapshot)
+}
+
+fn create_window_in_snapshot(snapshot: &mut WorkspaceSnapshot, title: Option<String>) {
     let window =
         new_workspace_tab(title.unwrap_or_else(|| format!("window-{}", snapshot.tabs.len() + 1)));
     snapshot.active_tab_id = Some(window.id.clone());
     snapshot.tabs.push(window);
-    persist_workspace_snapshot(&state, snapshot)
+}
+
+fn close_window_in_snapshot(
+    snapshot: &mut WorkspaceSnapshot,
+    window_id: &str,
+) -> Result<Vec<String>, String> {
+    let mut session_ids = Vec::new();
+    let Some(window_index) = snapshot.tabs.iter().position(|tab| tab.id == window_id) else {
+        return Err("Window not found".to_string());
+    };
+
+    collect_session_ids(&snapshot.tabs[window_index].root, &mut session_ids);
+    snapshot.tabs.remove(window_index);
+
+    if snapshot.active_tab_id.as_deref() == Some(window_id) {
+        snapshot.active_tab_id = snapshot
+            .tabs
+            .get(window_index.saturating_sub(1))
+            .or_else(|| snapshot.tabs.first())
+            .map(|tab| tab.id.clone());
+    }
+
+    Ok(session_ids)
+}
+
+fn rename_window_in_snapshot(
+    snapshot: &mut WorkspaceSnapshot,
+    window_id: &str,
+    title: String,
+) -> Result<(), String> {
+    let window = snapshot
+        .tabs
+        .iter_mut()
+        .find(|tab| tab.id == window_id)
+        .ok_or_else(|| "Window not found".to_string())?;
+    window.title = title;
+    Ok(())
+}
+
+fn set_active_window_in_snapshot(
+    snapshot: &mut WorkspaceSnapshot,
+    window_id: &str,
+) -> Result<(), String> {
+    if !snapshot.tabs.iter().any(|tab| tab.id == window_id) {
+        return Err("Window not found".to_string());
+    }
+    snapshot.active_tab_id = Some(window_id.to_string());
+    Ok(())
+}
+
+fn map_window_error_to_tab(error: String) -> String {
+    if error == "Window not found" {
+        "Tab not found".to_string()
+    } else {
+        error
+    }
 }
 
 #[tauri::command]
@@ -1027,24 +1087,9 @@ fn close_window(
     window_id: String,
 ) -> Result<WorkspaceSnapshot, String> {
     let (session_ids, mut snapshot) = {
-        let mut session_ids = Vec::new();
         let mut snapshot =
             load_workspace_session_snapshot(&state, &project_id, &workspace_session_id)?;
-        let Some(window_index) = snapshot.tabs.iter().position(|tab| tab.id == window_id) else {
-            return Err("Window not found".to_string());
-        };
-
-        collect_session_ids(&snapshot.tabs[window_index].root, &mut session_ids);
-        snapshot.tabs.remove(window_index);
-
-        if snapshot.active_tab_id.as_deref() == Some(window_id.as_str()) {
-            snapshot.active_tab_id = snapshot
-                .tabs
-                .get(window_index.saturating_sub(1))
-                .or_else(|| snapshot.tabs.first())
-                .map(|tab| tab.id.clone());
-        }
-
+        let session_ids = close_window_in_snapshot(&mut snapshot, &window_id)?;
         (session_ids, snapshot)
     };
 
@@ -1065,9 +1110,7 @@ fn rename_window(
     title: String,
 ) -> Result<WorkspaceSnapshot, String> {
     let mut snapshot = load_workspace_session_snapshot(&state, &project_id, &workspace_session_id)?;
-    if let Some(window) = snapshot.tabs.iter_mut().find(|tab| tab.id == window_id) {
-        window.title = title;
-    }
+    rename_window_in_snapshot(&mut snapshot, &window_id, title)?;
     persist_workspace_snapshot(&state, snapshot)
 }
 
@@ -1079,7 +1122,69 @@ fn set_active_window(
     window_id: String,
 ) -> Result<WorkspaceSnapshot, String> {
     let mut snapshot = load_workspace_session_snapshot(&state, &project_id, &workspace_session_id)?;
+    set_active_window_in_snapshot(&mut snapshot, &window_id)?;
+    persist_workspace_snapshot(&state, snapshot)
+}
+
+#[tauri::command]
+fn set_active_pane(
+    state: State<'_, AppState>,
+    project_id: String,
+    workspace_session_id: String,
+    window_id: String,
+    pane_id: String,
+) -> Result<WorkspaceSnapshot, String> {
+    let mut snapshot = load_workspace_session_snapshot(&state, &project_id, &workspace_session_id)?;
+    let tab = snapshot
+        .tabs
+        .iter_mut()
+        .find(|tab| tab.id == window_id)
+        .ok_or_else(|| "Window not found".to_string())?;
+    if !stack_exists(&tab.root, &pane_id) {
+        return Err("Pane not found".to_string());
+    }
+
+    tab.active_pane_id = Some(pane_id);
     snapshot.active_tab_id = Some(window_id);
+    persist_workspace_snapshot(&state, snapshot)
+}
+
+#[tauri::command]
+fn get_session_sidebar_status(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<SessionSidebarStatus, String> {
+    let session = {
+        let db = state
+            .db
+            .lock()
+            .map_err(|_| "Database lock poisoned".to_string())?;
+        db.get_session(&session_id)?
+            .ok_or_else(|| "Session not found".to_string())?
+    };
+
+    state.sessions.get_sidebar_status(&session)
+}
+
+#[tauri::command]
+fn move_pane(
+    state: State<'_, AppState>,
+    project_id: String,
+    workspace_session_id: String,
+    window_id: String,
+    source_pane_id: String,
+    target_pane_id: String,
+    placement: String,
+) -> Result<WorkspaceSnapshot, String> {
+    let mut snapshot = load_workspace_session_snapshot(&state, &project_id, &workspace_session_id)?;
+    move_pane_in_snapshot(
+        &mut snapshot,
+        &window_id,
+        &source_pane_id,
+        &target_pane_id,
+        &placement,
+    )?;
+    refresh_snapshot_sessions(&state, &mut snapshot)?;
     persist_workspace_snapshot(&state, snapshot)
 }
 
@@ -1106,12 +1211,7 @@ fn create_tab(
 ) -> Result<WorkspaceSnapshot, String> {
     let session_id =
         workspace_session_id.unwrap_or(default_workspace_session_id(&state, &project_id)?);
-    let mut snapshot = load_workspace_session_snapshot(&state, &project_id, &session_id)?;
-    let tab =
-        new_workspace_tab(title.unwrap_or_else(|| format!("tab-{}", snapshot.tabs.len() + 1)));
-    snapshot.active_tab_id = Some(tab.id.clone());
-    snapshot.tabs.push(tab);
-    persist_workspace_snapshot(&state, snapshot)
+    create_window(state, project_id, session_id, title)
 }
 
 #[tauri::command]
@@ -1121,34 +1221,9 @@ fn close_tab(
     workspace_session_id: Option<String>,
     tab_id: String,
 ) -> Result<WorkspaceSnapshot, String> {
-    let (session_ids, mut snapshot) = {
-        let mut session_ids = Vec::new();
-        let session_id =
-            workspace_session_id.unwrap_or(default_workspace_session_id(&state, &project_id)?);
-        let mut snapshot = load_workspace_session_snapshot(&state, &project_id, &session_id)?;
-        let Some(tab_index) = snapshot.tabs.iter().position(|tab| tab.id == tab_id) else {
-            return Err("Tab not found".to_string());
-        };
-
-        collect_session_ids(&snapshot.tabs[tab_index].root, &mut session_ids);
-        snapshot.tabs.remove(tab_index);
-
-        if snapshot.tabs.is_empty() {
-            let replacement = new_workspace_tab("main".to_string());
-            snapshot.active_tab_id = Some(replacement.id.clone());
-            snapshot.tabs.push(replacement);
-        } else if snapshot.active_tab_id.as_deref() == Some(tab_id.as_str()) {
-            snapshot.active_tab_id = Some(snapshot.tabs[tab_index.saturating_sub(1)].id.clone());
-        }
-        (session_ids, snapshot)
-    };
-
-    for session_id in &session_ids {
-        terminate_if_running(&state, &session_id)?;
-    }
-
-    refresh_snapshot_sessions(&state, &mut snapshot)?;
-    persist_workspace_snapshot(&state, snapshot)
+    let session_id =
+        workspace_session_id.unwrap_or(default_workspace_session_id(&state, &project_id)?);
+    close_window(state, project_id, session_id, tab_id).map_err(map_window_error_to_tab)
 }
 
 #[tauri::command]
@@ -1161,11 +1236,7 @@ fn rename_tab(
 ) -> Result<WorkspaceSnapshot, String> {
     let session_id =
         workspace_session_id.unwrap_or(default_workspace_session_id(&state, &project_id)?);
-    let mut snapshot = load_workspace_session_snapshot(&state, &project_id, &session_id)?;
-    if let Some(tab) = snapshot.tabs.iter_mut().find(|tab| tab.id == tab_id) {
-        tab.title = title;
-    }
-    persist_workspace_snapshot(&state, snapshot)
+    rename_window(state, project_id, session_id, tab_id, title).map_err(map_window_error_to_tab)
 }
 
 #[tauri::command]
@@ -1177,9 +1248,7 @@ fn set_active_tab(
 ) -> Result<WorkspaceSnapshot, String> {
     let session_id =
         workspace_session_id.unwrap_or(default_workspace_session_id(&state, &project_id)?);
-    let mut snapshot = load_workspace_session_snapshot(&state, &project_id, &session_id)?;
-    snapshot.active_tab_id = Some(tab_id);
-    persist_workspace_snapshot(&state, snapshot)
+    set_active_window(state, project_id, session_id, tab_id).map_err(map_window_error_to_tab)
 }
 
 #[tauri::command]
@@ -1782,6 +1851,7 @@ fn main() {
             close_window,
             rename_window,
             set_active_window,
+            set_active_pane,
             open_workspace,
             create_tab,
             close_tab,
@@ -1790,11 +1860,13 @@ fn main() {
             split_pane,
             close_stack_session,
             close_pane,
+            move_pane,
             create_session,
             write_session_input,
             resize_session,
             report_tab_viewport,
             read_clipboard_payload,
+            get_session_sidebar_status,
             terminate_session,
             set_active_stack_item_command
         ])
@@ -1974,6 +2046,90 @@ fn close_pane_in_snapshot(
             Ok(session_ids)
         }
     }
+}
+
+fn move_pane_in_snapshot(
+    snapshot: &mut WorkspaceSnapshot,
+    window_id: &str,
+    source_pane_id: &str,
+    target_pane_id: &str,
+    placement: &str,
+) -> Result<(), String> {
+    let tab_index = snapshot
+        .tabs
+        .iter()
+        .position(|tab| tab.id == window_id)
+        .ok_or_else(|| "Window not found".to_string())?;
+
+    if !stack_exists(&snapshot.tabs[tab_index].root, source_pane_id) {
+        return Err("Source pane not found".to_string());
+    }
+    if !stack_exists(&snapshot.tabs[tab_index].root, target_pane_id) {
+        return Err("Target pane not found".to_string());
+    }
+
+    if source_pane_id == target_pane_id {
+        return Ok(());
+    }
+
+    match placement {
+        "swap" => {
+            let source_node = clone_stack_node(&snapshot.tabs[tab_index].root, source_pane_id)
+                .ok_or_else(|| "Source pane not found".to_string())?;
+            let target_node = clone_stack_node(&snapshot.tabs[tab_index].root, target_pane_id)
+                .ok_or_else(|| "Target pane not found".to_string())?;
+            let placeholder_id = Uuid::new_v4().to_string();
+            let mut placeholder = source_node.clone();
+            match &mut placeholder {
+                models::LayoutNode::Stack { id, .. } => {
+                    *id = placeholder_id.clone();
+                }
+                models::LayoutNode::Split { .. } => {
+                    return Err("Only pane stacks can be moved".to_string());
+                }
+            }
+
+            let tab = &mut snapshot.tabs[tab_index];
+            let _ = replace_stack_node(&mut tab.root, source_pane_id, &placeholder);
+            let _ = replace_stack_node(&mut tab.root, target_pane_id, &source_node);
+            let _ = replace_stack_node(&mut tab.root, &placeholder_id, &target_node);
+            tab.active_pane_id = Some(source_pane_id.to_string());
+            normalize_tab(tab);
+        }
+        "left" | "right" | "top" | "bottom" => {
+            let detached = detach_pane_from_snapshot(snapshot, window_id, source_pane_id)?;
+            let tab = snapshot
+                .tabs
+                .iter_mut()
+                .find(|tab| tab.id == window_id)
+                .ok_or_else(|| "Window not found".to_string())?;
+            let (direction, insertion) = match placement {
+                "left" => ("horizontal", SplitInsertion::Before),
+                "right" => ("horizontal", SplitInsertion::After),
+                "top" => ("vertical", SplitInsertion::Before),
+                "bottom" => ("vertical", SplitInsertion::After),
+                _ => unreachable!(),
+            };
+            let mut detached_opt = Some(detached);
+            if !insert_existing_stack_node(
+                &mut tab.root,
+                target_pane_id,
+                direction,
+                insertion,
+                Some(50),
+                &mut detached_opt,
+            ) {
+                return Err("Target pane not found".to_string());
+            }
+            tab.active_pane_id = Some(source_pane_id.to_string());
+            normalize_tab(tab);
+        }
+        _ => return Err("Unsupported pane placement".to_string()),
+    }
+
+    snapshot.active_tab_id = Some(window_id.to_string());
+    ensure_valid_active_tab(snapshot);
+    Ok(())
 }
 
 fn close_tab_root_or_reset(snapshot: &mut WorkspaceSnapshot, tab_index: usize) {
@@ -6949,10 +7105,12 @@ mod tests {
     use super::{
         ClientListing, ResizePaneRequest, SessionListing, TabViewport, WindowListing,
         WorkspaceSnapshot, apply_tmux_resize_to_tab, close_pane_in_snapshot,
-        current_tmux_pane_id, query_flag, remove_session_from_snapshot,
+        current_tmux_pane_id, map_window_error_to_tab, query_flag,
+        remove_session_from_snapshot, rename_window_in_snapshot,
         render_tmux_client_format, render_tmux_session_format, render_tmux_window_format,
         resolve_directional_pane_id, resolve_relative_window_id, resolve_target_window_id,
-        resolve_tmux_split_direction, split_tmux_pane, ensure_workspace_snapshot_has_window,
+        resolve_tmux_split_direction, set_active_window_in_snapshot, split_tmux_pane,
+        ensure_workspace_snapshot_has_window,
     };
     use crate::layout::{add_session_to_stack, first_stack_id, new_workspace_tab};
     use crate::layout::SplitInsertion;
@@ -7104,6 +7262,54 @@ mod tests {
         assert!(!ensure_workspace_snapshot_has_window(&mut snapshot));
         assert_eq!(snapshot.tabs.len(), 1);
         assert_eq!(snapshot.tabs[0].id, existing_id);
+    }
+
+    #[test]
+    fn set_active_window_in_snapshot_rejects_unknown_window() {
+        let existing = new_workspace_tab("main".to_string());
+        let mut snapshot = WorkspaceSnapshot {
+            project_id: "project-1".to_string(),
+            session_id: "workspace-session-1".to_string(),
+            active_tab_id: Some(existing.id.clone()),
+            tabs: vec![existing],
+            sessions: Vec::new(),
+        };
+
+        let error =
+            set_active_window_in_snapshot(&mut snapshot, "missing-window").expect_err("missing");
+        assert_eq!(error, "Window not found");
+    }
+
+    #[test]
+    fn rename_window_in_snapshot_rejects_unknown_window() {
+        let existing = new_workspace_tab("main".to_string());
+        let mut snapshot = WorkspaceSnapshot {
+            project_id: "project-1".to_string(),
+            session_id: "workspace-session-1".to_string(),
+            active_tab_id: Some(existing.id.clone()),
+            tabs: vec![existing],
+            sessions: Vec::new(),
+        };
+
+        let error = rename_window_in_snapshot(
+            &mut snapshot,
+            "missing-window",
+            "renamed".to_string(),
+        )
+        .expect_err("missing");
+        assert_eq!(error, "Window not found");
+    }
+
+    #[test]
+    fn tab_error_mapping_matches_window_not_found() {
+        assert_eq!(
+            map_window_error_to_tab("Window not found".to_string()),
+            "Tab not found".to_string()
+        );
+        assert_eq!(
+            map_window_error_to_tab("Other error".to_string()),
+            "Other error".to_string()
+        );
     }
 
     #[test]
