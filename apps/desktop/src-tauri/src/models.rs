@@ -38,13 +38,21 @@ pub enum WorkspaceSessionCreatedBy {
     Ai,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum SessionStatus {
     Starting,
     Running,
     Exited,
     Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SessionStatusProvider {
+    Terminal,
+    Claude,
+    Codex,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -183,6 +191,22 @@ pub struct SessionWorkspaceSnapshot {
 pub struct SessionOutputEvent {
     pub session_id: String,
     pub chunk: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionSidebarStatus {
+    pub session_id: String,
+    pub launch_profile: LaunchProfile,
+    pub provider: SessionStatusProvider,
+    pub state: SessionStatus,
+    pub model_label: Option<String>,
+    pub mode_label: Option<String>,
+    pub context_percent: Option<u8>,
+    pub usage5h_percent: Option<u8>,
+    pub usage5h_reset_at: Option<String>,
+    pub usage7d_percent: Option<u8>,
+    pub usage7d_reset_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

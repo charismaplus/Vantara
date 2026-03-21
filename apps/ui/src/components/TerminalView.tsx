@@ -8,10 +8,16 @@ import { registerTerminal, unregisterTerminal } from "../lib/terminalRegistry";
 type TerminalViewProps = {
   sessionId: string;
   variant?: "user" | "ai";
+  onActivate?: () => void;
 };
 
-export function TerminalView({ sessionId, variant = "user" }: TerminalViewProps) {
+export function TerminalView({ sessionId, variant = "user", onActivate }: TerminalViewProps) {
   const hostRef = useRef<HTMLDivElement | null>(null);
+  const onActivateRef = useRef(onActivate);
+
+  useEffect(() => {
+    onActivateRef.current = onActivate;
+  }, [onActivate]);
 
   useEffect(() => {
     const host = hostRef.current;
@@ -52,6 +58,10 @@ export function TerminalView({ sessionId, variant = "user" }: TerminalViewProps)
       terminal.loadAddon(fit);
       terminal.open(host);
       console.debug("[terminal] mount", { sessionId, variant });
+      const handleFocusIn = () => {
+        onActivateRef.current?.();
+      };
+      host.addEventListener("focusin", handleFocusIn);
 
       terminal.attachCustomKeyEventHandler((event) => {
         if (event.type !== "keydown") {
@@ -221,6 +231,7 @@ export function TerminalView({ sessionId, variant = "user" }: TerminalViewProps)
         disposeData?.dispose();
         host.removeEventListener("dragover", handleDragOver);
         host.removeEventListener("drop", handleDrop);
+        host.removeEventListener("focusin", handleFocusIn);
         unregisterTerminal(sessionId);
         terminal.dispose();
       };
@@ -243,6 +254,7 @@ export function TerminalView({ sessionId, variant = "user" }: TerminalViewProps)
       className={`terminal-host ${variant === "ai" ? "ai-terminal" : "user-terminal"}`}
       data-terminal-session-id={sessionId}
       ref={hostRef}
+      onMouseDown={() => onActivateRef.current?.()}
     />
   );
 }

@@ -1,4 +1,8 @@
-import type { SessionOutputEvent, WorkspaceChangedEvent } from "../../../../packages/contracts/src/index.ts";
+import type {
+  SessionOutputEvent,
+  SessionSidebarStatus,
+  WorkspaceChangedEvent,
+} from "../../../../packages/contracts/src/index.ts";
 
 import { isTauriRuntime } from "./runtime";
 
@@ -40,6 +44,17 @@ export async function listenWorkspaceChanged(
 
   const { listen } = await import("@tauri-apps/api/event");
   return listen<WorkspaceChangedEvent>("workspace-changed", handler);
+}
+
+export async function listenSessionStatusChanged(
+  handler: (event: { payload: SessionSidebarStatus }) => void,
+) {
+  if (!isTauriRuntime()) {
+    return () => {};
+  }
+
+  const { listen } = await import("@tauri-apps/api/event");
+  return listen<SessionSidebarStatus>("session-status-changed", handler);
 }
 
 export async function listenWindowFileDrop(handler: (event: WindowFileDropEvent) => void) {

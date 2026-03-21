@@ -16,6 +16,8 @@ export type DeleteProjectResult = {
 export type SessionStatus = "starting" | "running" | "exited" | "failed";
 export type LaunchProfile = "terminal" | "claude" | "claudeUnsafe" | "codex" | "codexFullAuto";
 export type WorkspaceSessionCreatedBy = "user" | "ai";
+export type SessionStatusProvider = "terminal" | "claude" | "codex";
+export type PaneMovePlacement = "swap" | "left" | "right" | "top" | "bottom";
 
 export type TerminalSession = {
   id: string;
@@ -102,6 +104,20 @@ export type SessionWorkspaceSnapshot = {
 export type SessionOutputEvent = {
   sessionId: string;
   chunk: string;
+};
+
+export type SessionSidebarStatus = {
+  sessionId: string;
+  launchProfile: LaunchProfile;
+  provider: SessionStatusProvider;
+  state: SessionStatus;
+  modelLabel?: string | null;
+  modeLabel?: string | null;
+  contextPercent?: number | null;
+  usage5hPercent?: number | null;
+  usage5hResetAt?: string | null;
+  usage7dPercent?: number | null;
+  usage7dResetAt?: string | null;
 };
 
 export type WorkspaceChangedEvent = {

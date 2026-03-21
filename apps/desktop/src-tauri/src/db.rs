@@ -399,6 +399,17 @@ impl Database {
         )
     }
 
+    pub fn get_session(&self, session_id: &str) -> Result<Option<TerminalSession>, String> {
+        Ok(self
+            .list_sessions_query(
+                "SELECT id, project_id, workspace_session_id, window_id, title, COALESCE(program, shell), args_json, launch_profile, tmux_shim_enabled, cwd, status, started_at, ended_at, exit_code
+                 FROM sessions WHERE id = ?1",
+                params![session_id],
+            )?
+            .into_iter()
+            .next())
+    }
+
     fn list_sessions_query<P>(&self, sql: &str, params: P) -> Result<Vec<TerminalSession>, String>
     where
         P: rusqlite::Params,

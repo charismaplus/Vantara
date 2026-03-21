@@ -3,10 +3,12 @@ import type {
   DeleteProjectResult,
   LayoutNode,
   LaunchProfile,
+  PaneMovePlacement,
   PaneLaunchState,
   PastePayload,
   Project,
   ProjectWorkspaceSnapshot,
+  SessionSidebarStatus,
   StackItem,
   TerminalSession,
   WorkspaceSession,
@@ -69,7 +71,7 @@ export async function createProject(name: string, path: string) {
     const session = createMockWorkspaceSession(project.id, "main", "user", null);
     mockState.projects.unshift(project);
     mockState.projectSnapshots.set(project.id, { projectId: project.id, sessions: [session] });
-    mockState.sessionSnapshots.set(session.id, createEmptySessionSnapshot(project.id, session.id));
+    mockState.sessionSnapshots.set(session.id, createEmptySessionSnapshot(project.id, session.id, mockState));
     return project;
   }
 
@@ -140,8 +142,8 @@ export async function createWorkspaceSession(projectId: string, args: CreateWork
       args.createdBy ?? "user",
       args.sourceSessionId ?? null,
     );
-    snapshot.sessions.unshift(session);
-    mockState.sessionSnapshots.set(session.id, createEmptySessionSnapshot(projectId, session.id));
+    snapshot.sessions.push(session);
+    mockState.sessionSnapshots.set(session.id, createEmptySessionSnapshot(projectId, session.id, mockState));
     return { ...session };
   }
 
@@ -182,7 +184,7 @@ export async function deleteWorkspaceSession(projectId: string, workspaceSession
     if (!projectSnapshot.sessions.length) {
       const fallback = createMockWorkspaceSession(projectId, "main", "user", null);
       projectSnapshot.sessions = [fallback];
-      mockState.sessionSnapshots.set(fallback.id, createEmptySessionSnapshot(projectId, fallback.id));
+      mockState.sessionSnapshots.set(fallback.id, createEmptySessionSnapshot(projectId, fallback.id, mockState));
     }
     return cloneProjectSnapshot(projectSnapshot);
   }
@@ -219,7 +221,13 @@ export async function closeWindow(projectId: string, workspaceSessionId: string,
     const removed = snapshot.windows.splice(index, 1)[0];
     const removedSessionIds = collectSessionIds(removed.root);
     snapshot.terminals = snapshot.terminals.filter((entry) => !removedSessionIds.includes(entry.id));
-    snapshot.activeWindowId = snapshot.windows[Math.max(0, index - 1)]?.id ?? snapshot.windows[0]?.id ?? null;
+    if (!snapshot.windows.length) {
+      const replacement = createMockTab("main");
+      snapshot.windows.push(replacement);
+      snapshot.activeWindowId = replacement.id;
+    } else {
+      snapshot.activeWindowId = snapshot.windows[Math.max(0, index - 1)]?.id ?? snapshot.windows[0]?.id ?? null;
+    }
     return cloneSessionSnapshot(snapshot);
   }
 
@@ -252,6 +260,30 @@ export async function setActiveWindow(projectId: string, workspaceSessionId: str
 
   return normalizeSessionWorkspaceSnapshot(
     await invoke("set_active_window", { projectId, workspaceSessionId, windowId }),
+    projectId,
+    workspaceSessionId,
+  );
+}
+
+export async function setActivePane(
+  projectId: string,
+  workspaceSessionId: string,
+  windowId: string,
+  paneId: string,
+) {
+  if (!isTauriRuntime()) {
+    const snapshot = getMockSessionSnapshot(projectId, workspaceSessionId);
+    const window = requireWindow(snapshot, windowId);
+    if (!stackExists(window.root, paneId)) {
+      throw new Error("Pane not found");
+    }
+    window.activePaneId = paneId;
+    snapshot.activeWindowId = windowId;
+    return cloneSessionSnapshot(snapshot);
+  }
+
+  return normalizeSessionWorkspaceSnapshot(
+    await invoke("set_active_pane", { projectId, workspaceSessionId, windowId, paneId }),
     projectId,
     workspaceSessionId,
   );
@@ -370,6 +402,29 @@ export async function closePane(projectId: string, workspaceSessionId: string, w
   );
 }
 
+export async function movePane(
+  projectId: string,
+  workspaceSessionId: string,
+  windowId: string,
+  sourcePaneId: string,
+  targetPaneId: string,
+  placement: PaneMovePlacement,
+) {
+  if (!isTauriRuntime()) {
+    const snapshot = getMockSessionSnapshot(projectId, workspaceSessionId);
+    const window = requireWindow(snapshot, windowId);
+    moveMockPane(window, sourcePaneId, targetPaneId, placement);
+    snapshot.activeWindowId = windowId;
+    return cloneSessionSnapshot(snapshot);
+  }
+
+  return normalizeSessionWorkspaceSnapshot(
+    await invoke("move_pane", { projectId, workspaceSessionId, windowId, sourcePaneId, targetPaneId, placement }),
+    projectId,
+    workspaceSessionId,
+  );
+}
+
 export async function writeSessionInput(sessionId: string, input: string) {
   if (!isTauriRuntime()) {
     void sessionId;
@@ -416,6 +471,14 @@ export async function readClipboardPayload(): Promise<PastePayload> {
   return normalizePastePayload(await invoke("read_clipboard_payload"));
 }
 
+export async function getSessionSidebarStatus(sessionId: string): Promise<SessionSidebarStatus> {
+  if (!isTauriRuntime()) {
+    return buildMockSessionSidebarStatus(sessionId);
+  }
+
+  return normalizeSessionSidebarStatus(await invoke("get_session_sidebar_status", { sessionId }), sessionId);
+}
+
 function createMockState(): MockState {
   const state: MockState = {
     counter: 0,
@@ -443,7 +506,7 @@ function createMockState(): MockState {
   };
   state.projects = [project];
   state.projectSnapshots.set(project.id, { projectId: project.id, sessions: [session] });
-  state.sessionSnapshots.set(session.id, createEmptySessionSnapshot(project.id, session.id));
+  state.sessionSnapshots.set(session.id, createEmptySessionSnapshot(project.id, session.id, state));
   return state;
 }
 
@@ -485,20 +548,21 @@ function createMockWorkspaceSession(
   };
 }
 
-function createEmptySessionSnapshot(projectId: string, workspaceSessionId: string): WorkspaceSnapshot {
+function createEmptySessionSnapshot(projectId: string, workspaceSessionId: string, state: MockState = mockState): WorkspaceSnapshot {
+  const window = createMockTab("main", state);
   return {
     projectId,
     sessionId: workspaceSessionId,
-    activeWindowId: null,
-    windows: [],
+    activeWindowId: window.id,
+    windows: [window],
     terminals: [],
   };
 }
 
-function createMockTab(title: string): WorkspaceTab {
-  const root = createEmptyStack(1, "user", null);
+function createMockTab(title: string, state: MockState = mockState): WorkspaceTab {
+  const root = createEmptyStack(1, "user", null, undefined, state);
   return {
-    id: nextId("window"),
+    id: nextStateId(state, "window"),
     title,
     root,
     nextPaneOrdinal: 2,
@@ -511,11 +575,12 @@ function createEmptyStack(
   createdBy: "user" | "ai",
   sourcePaneId: string | null,
   launchState?: PaneLaunchState,
+  state: MockState = mockState,
 ): LayoutNode {
-  const itemId = nextId("item");
+  const itemId = nextStateId(state, "item");
   return {
     type: "stack",
-    id: nextId("stack"),
+    id: nextStateId(state, "stack"),
     paneOrdinal,
     paneLabel: `P${paneOrdinal}`,
     createdBy,
@@ -638,7 +703,9 @@ function normalizeSessionWorkspaceSnapshot(
   const sessionId = asString(record.sessionId ?? record.session_id, fallbackWorkspaceSessionId);
   const rawWindows = record.windows ?? record.tabs;
   const windowsSource: unknown[] = Array.isArray(rawWindows) ? rawWindows : [];
-  const windows = windowsSource.map((entry: unknown, index: number) => normalizeWindow(entry, index + 1));
+  const windows = windowsSource.length
+    ? windowsSource.map((entry: unknown, index: number) => normalizeWindow(entry, index + 1))
+    : [createMockTab("main")];
   const rawTerminals = record.terminals ?? record.sessions;
   const terminalsSource: unknown[] = Array.isArray(rawTerminals)
     ? rawTerminals
@@ -760,6 +827,37 @@ function normalizePastePayload(value: unknown): PastePayload {
   return { kind: "empty" };
 }
 
+function normalizeSessionSidebarStatus(value: unknown, fallbackSessionId: string): SessionSidebarStatus {
+  const record = asRecord(value);
+  return {
+    sessionId: asString(record.sessionId ?? record.session_id, fallbackSessionId),
+    launchProfile: normalizeLaunchProfile(record.launchProfile ?? record.launch_profile),
+    provider: record.provider === "claude" || record.provider === "codex" || record.provider === "terminal"
+      ? record.provider
+      : "terminal",
+    state: normalizeSessionStatus(record.state),
+    modelLabel: normalizeNullableString(record.modelLabel ?? record.model_label),
+    modeLabel: normalizeNullableString(record.modeLabel ?? record.mode_label),
+    contextPercent: typeof record.contextPercent === "number"
+      ? record.contextPercent
+      : typeof record.context_percent === "number"
+        ? record.context_percent
+        : null,
+    usage5hPercent: typeof record.usage5hPercent === "number"
+      ? record.usage5hPercent
+      : typeof record.usage5h_percent === "number"
+        ? record.usage5h_percent
+        : null,
+    usage5hResetAt: normalizeNullableString(record.usage5hResetAt ?? record.usage5h_reset_at),
+    usage7dPercent: typeof record.usage7dPercent === "number"
+      ? record.usage7dPercent
+      : typeof record.usage7d_percent === "number"
+        ? record.usage7d_percent
+        : null,
+    usage7dResetAt: normalizeNullableString(record.usage7dResetAt ?? record.usage7d_reset_at),
+  };
+}
+
 function splitMockStack(tab: WorkspaceTab, targetId: string, direction: SplitDirection): boolean {
   return splitMockNode(tab.root, tab, targetId, direction);
 }
@@ -830,6 +928,49 @@ function closeMockPane(node: LayoutNode, targetId: string): string[] | null {
   return null;
 }
 
+function moveMockPane(
+  window: WorkspaceTab,
+  sourcePaneId: string,
+  targetPaneId: string,
+  placement: PaneMovePlacement,
+) {
+  if (!stackExists(window.root, sourcePaneId)) {
+    throw new Error("Source pane not found");
+  }
+  if (!stackExists(window.root, targetPaneId)) {
+    throw new Error("Target pane not found");
+  }
+  if (sourcePaneId === targetPaneId) {
+    return;
+  }
+
+  if (placement === "swap") {
+    const sourceNode = cloneMockStackNode(window.root, sourcePaneId);
+    const targetNode = cloneMockStackNode(window.root, targetPaneId);
+    if (!sourceNode || !targetNode) {
+      throw new Error("Pane not found");
+    }
+    const placeholderId = nextId("stack-placeholder");
+    const placeholder = { ...sourceNode, id: placeholderId };
+    replaceMockStackNode(window.root, sourcePaneId, placeholder);
+    replaceMockStackNode(window.root, targetPaneId, sourceNode);
+    replaceMockStackNode(window.root, placeholderId, targetNode);
+    window.activePaneId = sourcePaneId;
+    return;
+  }
+
+  const detached = detachMockPane(window, sourcePaneId);
+  if (!detached) {
+    throw new Error("Source pane not found");
+  }
+  const direction = placement === "left" || placement === "right" ? "horizontal" : "vertical";
+  const insertion = placement === "left" || placement === "top" ? "before" : "after";
+  if (!insertMockStackNode(window.root, targetPaneId, direction, insertion, detached)) {
+    throw new Error("Target pane not found");
+  }
+  window.activePaneId = sourcePaneId;
+}
+
 function collectSessionIds(node: LayoutNode): string[] {
   return node.type === "stack"
     ? node.items.flatMap((item) => (item.sessionId ? [item.sessionId] : []))
@@ -847,6 +988,112 @@ function getFirstStackId(node: LayoutNode): string | null {
     }
   }
   return null;
+}
+
+function stackExists(node: LayoutNode, targetId: string): boolean {
+  return node.type === "stack"
+    ? node.id === targetId
+    : node.children.some((child) => stackExists(child, targetId));
+}
+
+function cloneMockStackNode(node: LayoutNode, targetId: string): Extract<LayoutNode, { type: "stack" }> | null {
+  if (node.type === "stack") {
+    return node.id === targetId ? JSON.parse(JSON.stringify(node)) as Extract<LayoutNode, { type: "stack" }> : null;
+  }
+  for (const child of node.children) {
+    const match = cloneMockStackNode(child, targetId);
+    if (match) {
+      return match;
+    }
+  }
+  return null;
+}
+
+function replaceMockStackNode(node: LayoutNode, targetId: string, replacement: LayoutNode): boolean {
+  if (node.type === "split") {
+    for (let index = 0; index < node.children.length; index += 1) {
+      const child = node.children[index];
+      if (child.type === "stack" && child.id === targetId) {
+        node.children[index] = JSON.parse(JSON.stringify(replacement)) as LayoutNode;
+        return true;
+      }
+      if (replaceMockStackNode(child, targetId, replacement)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+function detachMockPane(window: WorkspaceTab, targetId: string): Extract<LayoutNode, { type: "stack" }> | null {
+  const detached = cloneMockStackNode(window.root, targetId);
+  if (!detached) {
+    return null;
+  }
+  const sessionIds = closeMockPane(window.root, targetId);
+  if (!sessionIds) {
+    return null;
+  }
+  const nextActivePaneId = getFirstStackId(window.root);
+  if (nextActivePaneId) {
+    window.activePaneId = nextActivePaneId;
+  }
+  return detached;
+}
+
+function insertMockStackNode(
+  node: LayoutNode,
+  targetId: string,
+  direction: SplitDirection,
+  insertion: "before" | "after",
+  existingStack: Extract<LayoutNode, { type: "stack" }>,
+): boolean {
+  if (node.type === "stack" && node.id === targetId) {
+    const current = JSON.parse(JSON.stringify(node)) as LayoutNode;
+    Object.keys(node).forEach((key) => delete (node as Record<string, unknown>)[key]);
+    Object.assign(node, {
+      type: "split",
+      id: nextId("split"),
+      direction,
+      zoneKind: "default",
+      sizes: [50, 50],
+      children: insertion === "before"
+        ? [JSON.parse(JSON.stringify(existingStack)) as LayoutNode, current]
+        : [current, JSON.parse(JSON.stringify(existingStack)) as LayoutNode],
+    } satisfies LayoutNode);
+    return true;
+  }
+
+  return node.type === "split" && node.children.some((child) => insertMockStackNode(child, targetId, direction, insertion, existingStack));
+}
+
+function buildMockSessionSidebarStatus(sessionId: string): SessionSidebarStatus {
+  const session = Array.from(mockState.sessionSnapshots.values())
+    .flatMap((snapshot) => snapshot.terminals)
+    .find((entry) => entry.id === sessionId);
+  if (!session) {
+    throw new Error("Session not found");
+  }
+
+  const provider = session.launchProfile === "terminal"
+    ? "terminal"
+    : session.launchProfile === "claude" || session.launchProfile === "claudeUnsafe"
+      ? "claude"
+      : "codex";
+
+  return {
+    sessionId: session.id,
+    launchProfile: session.launchProfile,
+    provider,
+    state: session.status,
+    modelLabel: provider === "codex" ? "gpt-5.4 xhigh" : provider === "claude" ? "claude-opus-4-6" : null,
+    modeLabel: session.launchProfile === "codexFullAuto" ? "Full Auto" : session.launchProfile === "codex" ? "Interactive" : null,
+    contextPercent: provider === "codex" ? 100 : null,
+    usage5hPercent: provider === "claude" ? 42 : null,
+    usage5hResetAt: null,
+    usage7dPercent: provider === "claude" ? 18 : null,
+    usage7dResetAt: null,
+  };
 }
 
 function asRecord(value: unknown): Record<string, unknown> {
