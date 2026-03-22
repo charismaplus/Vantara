@@ -120,18 +120,6 @@ function getResolvedSplitLayout(node: Extract<LayoutNode, { type: "split" }>, sa
   return hasAllChildren && Object.keys(savedLayout).length === childIds.length ? savedLayout : fallbackLayout;
 }
 
-function collectPaneLabels(node: LayoutNode, paneLabels: Map<string, string>) {
-  if (isStackNode(node)) {
-    paneLabels.set(node.id, node.paneLabel);
-    return;
-  }
-  if (isSplitNode(node)) {
-    for (const child of node.children) {
-      collectPaneLabels(child, paneLabels);
-    }
-  }
-}
-
 function findStackNode(node: LayoutNode, targetId: string): Extract<LayoutNode, { type: "stack" }> | null {
   if (isStackNode(node)) {
     return node.id === targetId ? node : null;
@@ -256,14 +244,6 @@ export default function App() {
     [sessionSnapshot, activeWindow],
   );
   const activeTerminalSessionId = activeTerminalSession?.id ?? null;
-  const paneLabels = useMemo(() => {
-    const labels = new Map<string, string>();
-    if (activeWindow) {
-      collectPaneLabels(activeWindow.root, labels);
-    }
-    return labels;
-  }, [activeWindow]);
-
   useEffect(() => {
     activeProjectIdRef.current = activeProjectId;
   }, [activeProjectId]);
@@ -1134,8 +1114,7 @@ export default function App() {
 
     const activeItem = node.items.find((item) => item.id === node.activeItemId) ?? node.items[0];
     const session = activeItem?.sessionId ? sessions.get(activeItem.sessionId) : undefined;
-    const sourcePaneLabel = node.sourcePaneId ? paneLabels.get(node.sourcePaneId) : null;
-    const originLabel = node.createdBy === "ai" ? (sourcePaneLabel ? `AI from ${sourcePaneLabel}` : "AI") : null;
+    const originLabel = node.createdBy === "ai" ? "AI" : null;
     const isActivePane = activeWindow?.activePaneId === node.id;
     const showDropOverlay = Boolean(draggingPaneId && draggingPaneId !== node.id);
     const dropPlacement = dragTarget?.paneId === node.id ? dragTarget.placement : null;
