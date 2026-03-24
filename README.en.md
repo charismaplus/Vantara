@@ -15,7 +15,6 @@ Instead of treating terminals as a flat pile of tabs, Vantara structures work ar
 - Built-in launchers for `Claude Code`, `Claude Unsafe`, `Codex`, `Codex Full Auto`, and `Terminal`
 - tmux shim integration for AI CLI split/window workflows
 - Clipboard, drag-and-drop, and status-panel UX for developer workflows
-- Portable Windows build output
 
 ## Workspace Model
 
@@ -80,16 +79,10 @@ Build the frontend:
 npm run build
 ```
 
-Refresh the portable build:
+Build the desktop app:
 
 ```powershell
-npm run portable:refresh
-```
-
-Official portable output:
-
-```text
-target/release/bundle/portable/Vantara Portable/Vantara Portable.exe
+npm run tauri:build
 ```
 
 ## Repository Layout

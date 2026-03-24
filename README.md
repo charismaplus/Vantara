@@ -83,16 +83,10 @@ npm run tauri:dev
 npm run build
 ```
 
-포터블 빌드 갱신:
+데스크톱 앱 빌드:
 
 ```powershell
-npm run portable:refresh
-```
-
-공식 포터블 산출물 경로:
-
-```text
-target/release/bundle/portable/Vantara Portable/Vantara Portable.exe
+npm run tauri:build
 ```
 
 ## 저장소 구조
