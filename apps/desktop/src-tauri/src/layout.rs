@@ -214,8 +214,13 @@ pub fn wrap_root_with_split(
         LayoutNode::Split { .. } => unreachable!("new_stack_node must create a stack"),
     };
 
-    let (children, sizes) =
-        split_children_with_sizes(current_root, new_stack, insertion, new_child_size, direction);
+    let (children, sizes) = split_children_with_sizes(
+        current_root,
+        new_stack,
+        insertion,
+        new_child_size,
+        direction,
+    );
 
     tab.root = LayoutNode::Split {
         id: Uuid::new_v4().to_string(),

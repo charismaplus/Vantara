@@ -3,6 +3,8 @@ dist/
 build/
 target/
 *.log
+docs/*.md
+docs/**/*.md
 apps/ui/node_modules/
 apps/ui/dist/
 apps/desktop/src-tauri/target/
@@ -12,3 +14,6 @@ devhub_src/dist/
 devhub_src/shim/tmux.exe
 Workspace Terminal Portable.exe
 Workspace Terminal Portable - 바로 가기.lnk
+Vantara Portable.exe
+Vantara Portable.lnk
+Vantara Portable.zip

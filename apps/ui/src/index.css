@@ -335,9 +335,34 @@ textarea,
 }
 
 .tree-group {
+  position: relative;
   display: flex;
   flex-direction: column;
   gap: 4px;
+}
+
+.tree-group.drag-source {
+  opacity: 0.54;
+}
+
+.tree-group.drop-before::before,
+.tree-group.drop-after::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  height: 2px;
+  background: linear-gradient(90deg, rgba(32, 164, 243, 0.92), rgba(111, 210, 255, 0.92));
+  box-shadow: 0 0 0 1px rgba(7, 18, 28, 0.65);
+  pointer-events: none;
+}
+
+.tree-group.drop-before::before {
+  top: -3px;
+}
+
+.tree-group.drop-after::after {
+  bottom: -3px;
 }
 
 .tree-row {
@@ -362,7 +387,7 @@ textarea,
 }
 
 .tree-row-project {
-  grid-template-columns: 6px 22px minmax(0, 1fr) auto;
+  grid-template-columns: 6px 22px 18px minmax(0, 1fr) auto;
   gap: 6px;
   padding: 0 8px 0 0;
 }
@@ -429,6 +454,36 @@ textarea,
 
 .tree-disclosure.expanded .tree-disclosure-glyph {
   transform: translateX(1px) rotate(90deg);
+}
+
+.project-drag-handle {
+  appearance: none;
+  display: inline-grid;
+  place-items: center;
+  width: 18px;
+  height: 18px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(7, 18, 29, 0.72);
+  color: #7fb6e4;
+  cursor: grab;
+  transition: border-color 120ms ease, background-color 120ms ease, color 120ms ease;
+}
+
+.project-drag-handle:hover {
+  border-color: rgba(126, 205, 251, 0.36);
+  background: rgba(13, 31, 48, 0.96);
+  color: #def3ff;
+}
+
+.project-drag-handle:active {
+  cursor: grabbing;
+}
+
+.project-drag-handle-glyph {
+  font-size: 10px;
+  line-height: 1;
+  letter-spacing: -0.08em;
+  transform: rotate(90deg);
 }
 
 .tree-children {
@@ -716,15 +771,25 @@ textarea,
 .workspace-tabs {
   display: flex;
   align-items: flex-end;
-  gap: 2px;
+  gap: 8px;
   padding: 0 10px;
   min-height: 36px;
-  overflow: auto hidden;
   border-bottom: 1px solid var(--line-strong);
+  min-width: 0;
+}
+
+.workspace-tab-strip {
+  display: flex;
+  align-items: flex-end;
+  gap: 2px;
+  min-width: 0;
+  flex: 1 1 auto;
+  overflow: auto hidden;
   scrollbar-width: none;
 }
 
 .workspace-tabs::-webkit-scrollbar,
+.workspace-tab-strip::-webkit-scrollbar,
 .stack-tabs::-webkit-scrollbar {
   display: none;
 }
@@ -742,6 +807,27 @@ textarea,
   color: #bbd0e6;
   font-size: 12px;
   transition: background-color 120ms ease, color 120ms ease, border-color 120ms ease;
+}
+
+.workspace-tab-add {
+  flex: 0 0 auto;
+  margin-left: auto;
+  min-width: 92px;
+  justify-content: center;
+  background: linear-gradient(180deg, rgba(19, 44, 65, 0.94), rgba(10, 24, 37, 0.98));
+  color: #d9efff;
+  border-left: 1px solid rgba(126, 205, 251, 0.2);
+}
+
+.workspace-tab-add:hover {
+  background: linear-gradient(180deg, rgba(24, 58, 86, 0.98), rgba(12, 30, 45, 1));
+  color: #f3fbff;
+}
+
+.workspace-tab-add-glyph {
+  font-size: 14px;
+  line-height: 1;
+  color: #6fd2ff;
 }
 
 .workspace-tab:hover {

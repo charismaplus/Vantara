@@ -103,9 +103,7 @@ fn dispatch_tmux_command(
         "select-window" | "selectw" => handle_select_window(url, token, args),
         "last-window" | "last" => handle_cycle_window(url, token, "last", args),
         "next-window" | "next" => handle_cycle_window(url, token, "next", args),
-        "previous-window" | "prev" => {
-            handle_cycle_window(url, token, "previous", args)
-        }
+        "previous-window" | "prev" => handle_cycle_window(url, token, "previous", args),
         "resize-pane" | "resizep" => handle_resize_pane(url, token, args),
         "display-message" | "display" => handle_display_message(url, token, args),
         "refresh-client" | "refresh" => handle_refresh_client(url, token, args),
@@ -720,7 +718,11 @@ fn handle_list_clients(url: &str, token: &str, args: &[String]) -> Result<i32, S
         }
     }
     let encoded = urlencoding::encode(&format);
-    let body = get_text(url, token, &format!("/v1/tmux/list-clients?format={encoded}"))?;
+    let body = get_text(
+        url,
+        token,
+        &format!("/v1/tmux/list-clients?format={encoded}"),
+    )?;
     if !body.is_empty() {
         println!("{body}");
     }
@@ -970,7 +972,10 @@ fn handle_list_buffers(url: &str, token: &str, args: &[String]) -> Result<i32, S
     let body = get_text(
         url,
         token,
-        &format!("/v1/tmux/list-buffers?format={}", urlencoding::encode(&format)),
+        &format!(
+            "/v1/tmux/list-buffers?format={}",
+            urlencoding::encode(&format)
+        ),
     )?;
     if !body.is_empty() {
         println!("{body}");
@@ -1330,7 +1335,10 @@ fn parse_respawn_value(args: &[String]) -> serde_json::Value {
             "-e" => {
                 if index + 1 < args.len() {
                     if let Some((key, value)) = args[index + 1].split_once('=') {
-                        env.insert(key.to_string(), serde_json::Value::String(value.to_string()));
+                        env.insert(
+                            key.to_string(),
+                            serde_json::Value::String(value.to_string()),
+                        );
                     }
                 }
                 index += 2;
@@ -1419,12 +1427,7 @@ fn handle_break_pane(url: &str, token: &str, args: &[String]) -> Result<i32, Str
     Ok(0)
 }
 
-fn handle_join_pane(
-    url: &str,
-    token: &str,
-    args: &[String],
-    is_move: bool,
-) -> Result<i32, String> {
+fn handle_join_pane(url: &str, token: &str, args: &[String], is_move: bool) -> Result<i32, String> {
     let mut source: Option<String> = None;
     let mut target: Option<String> = None;
     let mut direction: Option<String> = None;
@@ -1812,7 +1815,11 @@ fn handle_list_windows(url: &str, token: &str, args: &[String]) -> Result<i32, S
     }
 
     let encoded = urlencoding::encode(&format);
-    let body = get_text(url, token, &format!("/v1/tmux/list-windows?format={encoded}"))?;
+    let body = get_text(
+        url,
+        token,
+        &format!("/v1/tmux/list-windows?format={encoded}"),
+    )?;
     if !body.is_empty() {
         println!("{body}");
     }
@@ -1837,7 +1844,11 @@ fn handle_list_sessions(url: &str, token: &str, args: &[String]) -> Result<i32, 
     }
 
     let encoded = urlencoding::encode(&format);
-    let body = get_text(url, token, &format!("/v1/tmux/list-sessions?format={encoded}"))?;
+    let body = get_text(
+        url,
+        token,
+        &format!("/v1/tmux/list-sessions?format={encoded}"),
+    )?;
     if !body.is_empty() {
         println!("{body}");
     }
@@ -1992,12 +2003,7 @@ fn handle_select_window(url: &str, token: &str, args: &[String]) -> Result<i32, 
     Ok(0)
 }
 
-fn handle_cycle_window(
-    url: &str,
-    token: &str,
-    mode: &str,
-    args: &[String],
-) -> Result<i32, String> {
+fn handle_cycle_window(url: &str, token: &str, mode: &str, args: &[String]) -> Result<i32, String> {
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
@@ -2111,11 +2117,15 @@ fn handle_capture_pane(url: &str, token: &str, args: &[String]) -> Result<i32, S
                 index += 1;
             }
             "-S" => {
-                start_line = args.get(index + 1).and_then(|value| value.parse::<i32>().ok());
+                start_line = args
+                    .get(index + 1)
+                    .and_then(|value| value.parse::<i32>().ok());
                 index += 2;
             }
             "-E" => {
-                end_line = args.get(index + 1).and_then(|value| value.parse::<i32>().ok());
+                end_line = args
+                    .get(index + 1)
+                    .and_then(|value| value.parse::<i32>().ok());
                 index += 2;
             }
             _ => {
@@ -2287,7 +2297,9 @@ fn tokenize_tmux_command_line(line: &str) -> Result<Vec<String>, String> {
     }
 
     if escape || in_single || in_double {
-        return Err("workspace-terminal-tmux: unterminated quoted string in source-file".to_string());
+        return Err(
+            "workspace-terminal-tmux: unterminated quoted string in source-file".to_string(),
+        );
     }
     if !current.is_empty() {
         tokens.push(current);
@@ -2316,10 +2328,7 @@ fn map_tmux_keys_to_text(keys: &[String]) -> String {
 
 fn parse_tmux_size(value: &str) -> (Option<u16>, bool) {
     if let Some(percent) = value.strip_suffix('%') {
-        let parsed = percent
-            .parse::<u16>()
-            .ok()
-            .map(|entry| entry.clamp(1, 99));
+        let parsed = percent.parse::<u16>().ok().map(|entry| entry.clamp(1, 99));
         return (parsed, true);
     }
 
@@ -2372,7 +2381,13 @@ fn render_tmux_response_format(format: &str, response: &serde_json::Value) -> St
     let session_attached = response
         .get("sessionAttached")
         .and_then(|value| value.as_bool())
-        .map(|value| if value { "1".to_string() } else { "0".to_string() })
+        .map(|value| {
+            if value {
+                "1".to_string()
+            } else {
+                "0".to_string()
+            }
+        })
         .unwrap_or_else(|| "0".to_string());
     let window_id = response
         .get("windowId")
@@ -2449,11 +2464,7 @@ fn parse_optional_u16(value: Option<&String>) -> Option<u16> {
 #[cfg(test)]
 mod tests {
     use super::dispatch_tmux_command;
-    use std::{
-        sync::mpsc,
-        thread,
-        time::Duration,
-    };
+    use std::{sync::mpsc, thread, time::Duration};
     use tiny_http::{Header, Response, Server};
 
     fn spawn_capture_server(
@@ -2512,13 +2523,8 @@ mod tests {
     #[test]
     fn dispatch_split_window_preserves_first_flag() {
         let (base_url, rx, handle) = spawn_capture_server("{}");
-        dispatch_tmux_command(
-            &base_url,
-            "token",
-            "split-window",
-            &["-h".to_string()],
-        )
-        .expect("dispatch split-window");
+        dispatch_tmux_command(&base_url, "token", "split-window", &["-h".to_string()])
+            .expect("dispatch split-window");
 
         let (path, body) = rx
             .recv_timeout(Duration::from_secs(2))

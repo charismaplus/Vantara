@@ -21,16 +21,16 @@ use anyhow::anyhow;
 use arboard::Clipboard;
 use db::{Database, now_iso};
 use layout::{
-    ClosePaneResult, CloseSessionResult, add_session_to_stack, close_session_in_layout,
-    close_stack_node, collect_session_ids, find_stack_id_for_session, first_stack_id,
-    new_stack_node, new_workspace_tab, normalize_tab, reset_tab_layout, set_active_stack_item,
-    split_stack_node, split_stack_node_with_options, stack_exists, wrap_root_with_split,
-    SplitInsertion,
+    ClosePaneResult, CloseSessionResult, SplitInsertion, add_session_to_stack,
+    close_session_in_layout, close_stack_node, collect_session_ids, find_stack_id_for_session,
+    first_stack_id, new_stack_node, new_workspace_tab, normalize_tab, reset_tab_layout,
+    set_active_stack_item, split_stack_node, split_stack_node_with_options, stack_exists,
+    wrap_root_with_split,
 };
 use models::{
     DeleteProjectResult, LaunchProfile, PaneCreatedBy, Project, ProjectWorkspaceSnapshot,
-    SessionSidebarStatus, SessionStatus, TerminalSession, WorkspaceChangedEvent,
-    WorkspaceSession, WorkspaceSessionCreatedBy, WorkspaceSnapshot, WorkspaceTab,
+    SessionSidebarStatus, SessionStatus, TerminalSession, WorkspaceChangedEvent, WorkspaceSession,
+    WorkspaceSessionCreatedBy, WorkspaceSnapshot, WorkspaceTab,
 };
 use serde::{Deserialize, Serialize};
 use sessions::{
@@ -473,12 +473,7 @@ impl TmuxShimState {
         Ok(())
     }
 
-    fn set_environment(
-        &self,
-        key: &str,
-        value: Option<String>,
-        unset: bool,
-    ) -> Result<(), String> {
+    fn set_environment(&self, key: &str, value: Option<String>, unset: bool) -> Result<(), String> {
         let mut synthetic = self
             .synthetic
             .lock()
@@ -801,7 +796,7 @@ fn create_project(
     }
 
     let normalized_path = normalize_path(path.trim())?;
-    let db = state
+    let mut db = state
         .db
         .lock()
         .map_err(|_| "Database lock poisoned".to_string())?;
@@ -830,6 +825,18 @@ fn rename_project(
 }
 
 #[tauri::command]
+fn reorder_projects(
+    state: State<'_, AppState>,
+    project_ids: Vec<String>,
+) -> Result<Vec<Project>, String> {
+    let mut db = state
+        .db
+        .lock()
+        .map_err(|_| "Database lock poisoned".to_string())?;
+    db.reorder_projects(&project_ids)
+}
+
+#[tauri::command]
 fn delete_project(
     state: State<'_, AppState>,
     project_id: String,
@@ -848,11 +855,7 @@ fn delete_project(
             .get(index + 1)
             .or_else(|| index.checked_sub(1).and_then(|prev| projects.get(prev)))
             .map(|project| project.id.clone());
-        let session_ids = db
-            .list_sessions(&project_id)?
-            .into_iter()
-            .map(|session| session.id)
-            .collect::<Vec<_>>();
+        let session_ids = db.list_session_ids_for_project(&project_id)?;
         (session_ids, next_project_id)
     };
 
@@ -1291,8 +1294,7 @@ fn close_stack_session(
 ) -> Result<WorkspaceSnapshot, String> {
     let workspace_session_id =
         workspace_session_id.unwrap_or(default_workspace_session_id(&state, &project_id)?);
-    let mut snapshot =
-        load_workspace_session_snapshot(&state, &project_id, &workspace_session_id)?;
+    let mut snapshot = load_workspace_session_snapshot(&state, &project_id, &workspace_session_id)?;
     close_session_in_snapshot(&mut snapshot, &tab_id, &stack_id, &session_id)?;
 
     terminate_if_running(&state, &session_id)?;
@@ -1336,8 +1338,7 @@ fn set_active_stack_item_command(
 ) -> Result<WorkspaceSnapshot, String> {
     let workspace_session_id =
         workspace_session_id.unwrap_or(default_workspace_session_id(&state, &project_id)?);
-    let mut snapshot =
-        load_workspace_session_snapshot(&state, &project_id, &workspace_session_id)?;
+    let mut snapshot = load_workspace_session_snapshot(&state, &project_id, &workspace_session_id)?;
 
     if let Some(tab) = snapshot.tabs.iter_mut().find(|tab| tab.id == tab_id) {
         set_active_stack_item(&mut tab.root, &stack_id, &item_id);
@@ -1360,8 +1361,13 @@ fn create_session(
     cwd: Option<String>,
     launch_profile: Option<LaunchProfile>,
 ) -> Result<WorkspaceSnapshot, String> {
-    let (resolved_window_id, resolved_stack_id) =
-        ensure_session_spawn_target(&state, &project_id, &workspace_session_id, window_id, stack_id)?;
+    let (resolved_window_id, resolved_stack_id) = ensure_session_spawn_target(
+        &state,
+        &project_id,
+        &workspace_session_id,
+        window_id,
+        stack_id,
+    )?;
     let (snapshot, _session) = spawn_session_in_stack(
         app,
         &state,
@@ -1427,8 +1433,11 @@ fn spawn_session_in_stack(
     };
 
     let mut snapshot = {
-        let snapshot =
-            load_workspace_session_snapshot(state, &request.project_id, &request.workspace_session_id)?;
+        let snapshot = load_workspace_session_snapshot(
+            state,
+            &request.project_id,
+            &request.workspace_session_id,
+        )?;
         let Some(tab) = snapshot.tabs.iter().find(|tab| tab.id == request.tab_id) else {
             return Err("Tab not found".to_string());
         };
@@ -1841,6 +1850,7 @@ fn main() {
             list_projects,
             create_project,
             rename_project,
+            reorder_projects,
             delete_project,
             open_project,
             open_session,
@@ -2606,24 +2616,26 @@ fn start_tmux_server(
     for _ in 0..TMUX_HTTP_WORKER_COUNT {
         let runtime_state = Arc::clone(&runtime_state);
         let request_queue = Arc::clone(&request_queue);
-        thread::spawn(move || loop {
-            let request = {
-                let mut queue = match request_queue.queue.lock() {
-                    Ok(queue) => queue,
-                    Err(_) => return,
-                };
-                while queue.is_empty() {
-                    queue = match request_queue.condvar.wait(queue) {
+        thread::spawn(move || {
+            loop {
+                let request = {
+                    let mut queue = match request_queue.queue.lock() {
                         Ok(queue) => queue,
                         Err(_) => return,
                     };
-                }
-                match queue.pop_front() {
-                    Some(request) => request,
-                    None => continue,
-                }
-            };
-            handle_tmux_http_request(request, runtime_state.as_ref());
+                    while queue.is_empty() {
+                        queue = match request_queue.condvar.wait(queue) {
+                            Ok(queue) => queue,
+                            Err(_) => return,
+                        };
+                    }
+                    match queue.pop_front() {
+                        Some(request) => request,
+                        None => continue,
+                    }
+                };
+                handle_tmux_http_request(request, runtime_state.as_ref());
+            }
         });
     }
 
@@ -3042,12 +3054,9 @@ fn normalize_tmux_context(
     state: &AppState,
     context: &TmuxTokenContext,
 ) -> Result<TmuxTokenContext, TmuxHttpError> {
-    let snapshot = load_workspace_session_snapshot(
-        state,
-        &context.project_id,
-        &context.workspace_session_id,
-    )
-    .map_err(internal_error)?;
+    let snapshot =
+        load_workspace_session_snapshot(state, &context.project_id, &context.workspace_session_id)
+            .map_err(internal_error)?;
     let session_alive = snapshot.sessions.iter().any(|session| {
         session.id == context.session_id
             && matches!(
@@ -3066,7 +3075,12 @@ fn normalize_tmux_context(
         .tabs
         .iter()
         .find(|tab| tab.id == context.current_tab_id)
-        .or_else(|| snapshot.tabs.iter().find(|tab| tab.id == context.origin_tab_id))
+        .or_else(|| {
+            snapshot
+                .tabs
+                .iter()
+                .find(|tab| tab.id == context.origin_tab_id)
+        })
         .or_else(|| snapshot.tabs.first());
     let Some(tab) = current_tab else {
         return Err(TmuxHttpError {
@@ -3162,14 +3176,15 @@ fn resolve_workspace_session_target(
         .map(extract_session_target_token)
         .unwrap_or_else(|| context.workspace_session_id.clone());
     if token.trim().is_empty() {
-        return load_workspace_session_record(state, &context.project_id, &context.workspace_session_id)
-            .map_err(internal_error);
+        return load_workspace_session_record(
+            state,
+            &context.project_id,
+            &context.workspace_session_id,
+        )
+        .map_err(internal_error);
     }
 
-    let normalized = token
-        .trim()
-        .trim_start_matches('=')
-        .trim_start_matches('$');
+    let normalized = token.trim().trim_start_matches('=').trim_start_matches('$');
 
     let db = state.db.lock().map_err(internal_error)?;
     let sessions = db
@@ -3178,7 +3193,10 @@ fn resolve_workspace_session_target(
     drop(db);
 
     if let Some(workspace_session) = sessions.iter().find(|entry| {
-        entry.id == normalized || entry.name == normalized || entry.id == token || entry.name == token
+        entry.id == normalized
+            || entry.name == normalized
+            || entry.id == token
+            || entry.name == token
     }) {
         return Ok(workspace_session.clone());
     }
@@ -3230,7 +3248,12 @@ fn ensure_tmux_session_runtime_target(
     let pane_id = current_tmux_pane_id(tab, &fallback_pane_id);
 
     let needs_spawn = !session_record_for_pane(&snapshot, &window_id, &pane_id)
-        .map(|session| matches!(session.status, SessionStatus::Starting | SessionStatus::Running))
+        .map(|session| {
+            matches!(
+                session.status,
+                SessionStatus::Starting | SessionStatus::Running
+            )
+        })
         .unwrap_or(false);
 
     if needs_spawn {
@@ -3340,7 +3363,11 @@ fn tmux_new_session(
     payload: NewSessionRequest,
 ) -> Result<serde_json::Value, TmuxHttpError> {
     let context = normalize_tmux_context(state, context)?;
-    if payload.target.as_deref().is_some_and(|target| !target.trim().is_empty()) {
+    if payload
+        .target
+        .as_deref()
+        .is_some_and(|target| !target.trim().is_empty())
+    {
         return Err(TmuxHttpError {
             status: 400,
             message: "tmux session grouping (-t for new-session) is not supported".to_string(),
@@ -3358,12 +3385,9 @@ fn tmux_new_session(
         .map_err(internal_error)?
     };
 
-    let mut snapshot = load_workspace_session_snapshot(
-        state,
-        &context.project_id,
-        &workspace_session.id,
-    )
-    .map_err(internal_error)?;
+    let mut snapshot =
+        load_workspace_session_snapshot(state, &context.project_id, &workspace_session.id)
+            .map_err(internal_error)?;
     let window = new_workspace_tab(
         payload
             .window_name
@@ -3410,7 +3434,8 @@ fn tmux_new_session(
 
     {
         let db = state.db.lock().map_err(internal_error)?;
-        db.touch_project(&context.project_id).map_err(internal_error)?;
+        db.touch_project(&context.project_id)
+            .map_err(internal_error)?;
         db.touch_workspace_session(&context.project_id, &workspace_session.id)
             .map_err(internal_error)?;
     }
@@ -3458,7 +3483,8 @@ fn tmux_attach_session(
 
     {
         let db = state.db.lock().map_err(internal_error)?;
-        db.touch_project(&context.project_id).map_err(internal_error)?;
+        db.touch_project(&context.project_id)
+            .map_err(internal_error)?;
         db.touch_workspace_session(&context.project_id, &workspace_session.id)
             .map_err(internal_error)?;
     }
@@ -3479,7 +3505,14 @@ fn tmux_attach_session(
         Some(workspace_session.id.clone()),
     );
 
-    build_tmux_session_response(state, &workspace_session, &snapshot, &window_id, &pane_id, true)
+    build_tmux_session_response(
+        state,
+        &workspace_session,
+        &snapshot,
+        &window_id,
+        &pane_id,
+        true,
+    )
 }
 
 fn tmux_switch_client(
@@ -3536,7 +3569,9 @@ fn tmux_kill_session(
     };
 
     if workspace_session.id == context.workspace_session_id
-        && !session_ids.iter().any(|session_id| session_id == &context.session_id)
+        && !session_ids
+            .iter()
+            .any(|session_id| session_id == &context.session_id)
     {
         if let Some(next_session) = remaining_sessions.first() {
             let (_, window_id, pane_id) = ensure_tmux_session_runtime_target(
@@ -3570,12 +3605,9 @@ fn tmux_split_window(
 ) -> Result<serde_json::Value, TmuxHttpError> {
     let context = normalize_tmux_context(state, context)?;
 
-    let mut snapshot = load_workspace_session_snapshot(
-        state,
-        &context.project_id,
-        &context.workspace_session_id,
-    )
-    .map_err(internal_error)?;
+    let mut snapshot =
+        load_workspace_session_snapshot(state, &context.project_id, &context.workspace_session_id)
+            .map_err(internal_error)?;
     let Some(tab) = snapshot
         .tabs
         .iter_mut()
@@ -3587,8 +3619,7 @@ fn tmux_split_window(
         });
     };
     let current_pane_id = current_tmux_pane_id(tab, &context.current_pane_id);
-    let target_pane_id =
-        resolve_target_pane_id(tab, payload.target.as_deref(), &current_pane_id)?;
+    let target_pane_id = resolve_target_pane_id(tab, payload.target.as_deref(), &current_pane_id)?;
     let direction = resolve_tmux_split_direction(payload.direction.as_deref());
     let insertion = if payload.before {
         SplitInsertion::Before
@@ -3618,7 +3649,11 @@ fn tmux_split_window(
         tab.active_pane_id = Some(new_pane_id.clone());
         state
             .tmux
-            .update_session_focus(&context.session_id, context.current_tab_id.clone(), new_pane_id.clone())
+            .update_session_focus(
+                &context.session_id,
+                context.current_tab_id.clone(),
+                new_pane_id.clone(),
+            )
             .map_err(internal_error)?;
     }
 
@@ -3677,12 +3712,9 @@ fn tmux_new_window(
 ) -> Result<serde_json::Value, TmuxHttpError> {
     let context = normalize_tmux_context(state, context)?;
 
-    let mut snapshot = load_workspace_session_snapshot(
-        state,
-        &context.project_id,
-        &context.workspace_session_id,
-    )
-    .map_err(internal_error)?;
+    let mut snapshot =
+        load_workspace_session_snapshot(state, &context.project_id, &context.workspace_session_id)
+            .map_err(internal_error)?;
     let anchor_window_id = resolve_target_window_id(
         &snapshot,
         payload.target.as_deref(),
@@ -3771,12 +3803,9 @@ fn tmux_send_keys(
     payload: SendKeysRequest,
 ) -> Result<(), TmuxHttpError> {
     let context = normalize_tmux_context(state, context)?;
-    let snapshot = load_workspace_session_snapshot(
-        state,
-        &context.project_id,
-        &context.workspace_session_id,
-    )
-    .map_err(internal_error)?;
+    let snapshot =
+        load_workspace_session_snapshot(state, &context.project_id, &context.workspace_session_id)
+            .map_err(internal_error)?;
     let Some(tab) = snapshot
         .tabs
         .iter()
@@ -3813,12 +3842,9 @@ fn tmux_list_panes(
     format: &str,
 ) -> Result<Vec<String>, TmuxHttpError> {
     let context = normalize_tmux_context(state, context)?;
-    let snapshot = load_workspace_session_snapshot(
-        state,
-        &context.project_id,
-        &context.workspace_session_id,
-    )
-    .map_err(internal_error)?;
+    let snapshot =
+        load_workspace_session_snapshot(state, &context.project_id, &context.workspace_session_id)
+            .map_err(internal_error)?;
     let session_name = tmux_session_name(state, &context.project_id, &context.workspace_session_id)
         .map_err(internal_error)?;
     let tab_index = snapshot
@@ -3853,12 +3879,9 @@ fn tmux_list_windows(
     format: &str,
 ) -> Result<Vec<String>, TmuxHttpError> {
     let context = normalize_tmux_context(state, context)?;
-    let snapshot = load_workspace_session_snapshot(
-        state,
-        &context.project_id,
-        &context.workspace_session_id,
-    )
-    .map_err(internal_error)?;
+    let snapshot =
+        load_workspace_session_snapshot(state, &context.project_id, &context.workspace_session_id)
+            .map_err(internal_error)?;
     let session_name = tmux_session_name(state, &context.project_id, &context.workspace_session_id)
         .map_err(internal_error)?;
     let listings = snapshot
@@ -3885,10 +3908,7 @@ fn tmux_list_sessions(
     format: &str,
 ) -> Result<Vec<String>, TmuxHttpError> {
     let context = normalize_tmux_context(state, context)?;
-    let db = state
-        .db
-        .lock()
-        .map_err(internal_error)?;
+    let db = state.db.lock().map_err(internal_error)?;
     let workspace_sessions = db
         .list_workspace_sessions(&context.project_id)
         .map_err(internal_error)?;
@@ -3897,12 +3917,9 @@ fn tmux_list_sessions(
     Ok(workspace_sessions
         .into_iter()
         .map(|workspace_session| {
-            let runtime_snapshot = load_workspace_session_snapshot(
-                state,
-                &context.project_id,
-                &workspace_session.id,
-            )
-            .map_err(internal_error)?;
+            let runtime_snapshot =
+                load_workspace_session_snapshot(state, &context.project_id, &workspace_session.id)
+                    .map_err(internal_error)?;
             let session_name = state
                 .tmux
                 .session_name(&workspace_session.id, &workspace_session.name)
@@ -4045,10 +4062,11 @@ fn tmux_set_option(
     let target_tab_id = if matches!(scope, TmuxOptionScope::Window) {
         Some(resolve_target_window_id(
             &load_workspace_session_snapshot(
-        state,
-        &context.project_id,
-        &context.workspace_session_id,
-    ).map_err(internal_error)?,
+                state,
+                &context.project_id,
+                &context.workspace_session_id,
+            )
+            .map_err(internal_error)?,
             payload.target.as_deref(),
             &context.current_tab_id,
             context.previous_tab_id.as_deref(),
@@ -4087,10 +4105,11 @@ fn tmux_show_options(
     let target_tab_id = if matches!(scope, TmuxOptionScope::Window) {
         Some(resolve_target_window_id(
             &load_workspace_session_snapshot(
-        state,
-        &context.project_id,
-        &context.workspace_session_id,
-    ).map_err(internal_error)?,
+                state,
+                &context.project_id,
+                &context.workspace_session_id,
+            )
+            .map_err(internal_error)?,
             target,
             &context.current_tab_id,
             context.previous_tab_id.as_deref(),
@@ -4125,7 +4144,12 @@ fn tmux_show_options(
 
     Ok(state
         .tmux
-        .option_entries(scope, &context.project_id, target_tab_id.as_deref(), global_only)
+        .option_entries(
+            scope,
+            &context.project_id,
+            target_tab_id.as_deref(),
+            global_only,
+        )
         .map_err(internal_error)?
         .into_iter()
         .map(|(entry_key, entry_value)| {
@@ -4154,7 +4178,10 @@ fn tmux_bind_key(
     }
     state
         .tmux
-        .set_key_binding(&tmux_binding_key(payload.table.as_deref(), key), Some(command.to_string()))
+        .set_key_binding(
+            &tmux_binding_key(payload.table.as_deref(), key),
+            Some(command.to_string()),
+        )
         .map_err(internal_error)?;
     Ok(())
 }
@@ -4218,14 +4245,7 @@ fn tmux_set_hook(
     let command = if payload.unset {
         None
     } else {
-        Some(
-            payload
-                .command
-                .as_deref()
-                .unwrap_or("")
-                .trim()
-                .to_string(),
-        )
+        Some(payload.command.as_deref().unwrap_or("").trim().to_string())
     };
     if command.as_deref().is_some_and(str::is_empty) {
         return Err(TmuxHttpError {
@@ -4282,11 +4302,7 @@ fn tmux_show_buffer(
     name: Option<&str>,
 ) -> Result<String, TmuxHttpError> {
     let _ = normalize_tmux_context(state, context)?;
-    let Some((_, value)) = state
-        .tmux
-        .buffer_value(name)
-        .map_err(internal_error)?
-    else {
+    let Some((_, value)) = state.tmux.buffer_value(name).map_err(internal_error)? else {
         return Err(TmuxHttpError {
             status: 404,
             message: "Buffer not found".to_string(),
@@ -4393,12 +4409,9 @@ fn tmux_paste_buffer(
             message: "Buffer not found".to_string(),
         });
     };
-    let snapshot = load_workspace_session_snapshot(
-        state,
-        &context.project_id,
-        &context.workspace_session_id,
-    )
-    .map_err(internal_error)?;
+    let snapshot =
+        load_workspace_session_snapshot(state, &context.project_id, &context.workspace_session_id)
+            .map_err(internal_error)?;
     let (tab_id, pane_id) = resolve_target_pane_ref(
         &snapshot,
         payload.target.as_deref(),
@@ -4471,11 +4484,9 @@ fn tmux_rename_window(
         });
     }
 
-    let mut snapshot = load_workspace_session_snapshot(
-        state,
-        &context.project_id,
-        &context.workspace_session_id,
-    ).map_err(internal_error)?;
+    let mut snapshot =
+        load_workspace_session_snapshot(state, &context.project_id, &context.workspace_session_id)
+            .map_err(internal_error)?;
     let target_window_id = resolve_target_window_id(
         &snapshot,
         payload.target.as_deref(),
@@ -4504,11 +4515,9 @@ fn tmux_respawn_pane(
     payload: RespawnPaneRequest,
 ) -> Result<serde_json::Value, TmuxHttpError> {
     let context = normalize_tmux_context(state, context)?;
-    let snapshot = load_workspace_session_snapshot(
-        state,
-        &context.project_id,
-        &context.workspace_session_id,
-    ).map_err(internal_error)?;
+    let snapshot =
+        load_workspace_session_snapshot(state, &context.project_id, &context.workspace_session_id)
+            .map_err(internal_error)?;
     let (tab_id, pane_id) = resolve_target_pane_ref(
         &snapshot,
         payload.target.as_deref(),
@@ -4533,37 +4542,39 @@ fn tmux_respawn_pane(
         .as_ref()
         .map(|session| session.launch_profile.clone())
         .unwrap_or_else(|| context.launch_profile.clone());
-    let (program, args, shell_kind, env_overrides, title, cwd) = if let Some(command) = payload.command.clone() {
-        let launch_spec = build_tmux_child_launch_spec(state, Some(command)).map_err(internal_error)?;
-        (
-            Some(launch_spec.program),
-            launch_spec.args,
-            launch_spec.shell_kind,
-            merge_env_maps(Some(launch_spec.env_overrides), payload.env.clone()),
-            existing_session
-                .as_ref()
-                .map(|session| session.title.clone())
-                .or_else(|| Some("tmux-respawn".to_string())),
-            payload
-                .cwd
-                .clone()
-                .or_else(|| existing_session.as_ref().map(|session| session.cwd.clone())),
-        )
-    } else if let Some(session) = existing_session.as_ref() {
-        (
-            Some(session.program.clone()),
-            session.args.clone(),
-            SessionShellKind::Default,
-            payload.env.clone(),
-            Some(session.title.clone()),
-            payload.cwd.clone().or_else(|| Some(session.cwd.clone())),
-        )
-    } else {
-        return Err(TmuxHttpError {
-            status: 400,
-            message: "Pane has no prior session to respawn; provide a command".to_string(),
-        });
-    };
+    let (program, args, shell_kind, env_overrides, title, cwd) =
+        if let Some(command) = payload.command.clone() {
+            let launch_spec =
+                build_tmux_child_launch_spec(state, Some(command)).map_err(internal_error)?;
+            (
+                Some(launch_spec.program),
+                launch_spec.args,
+                launch_spec.shell_kind,
+                merge_env_maps(Some(launch_spec.env_overrides), payload.env.clone()),
+                existing_session
+                    .as_ref()
+                    .map(|session| session.title.clone())
+                    .or_else(|| Some("tmux-respawn".to_string())),
+                payload
+                    .cwd
+                    .clone()
+                    .or_else(|| existing_session.as_ref().map(|session| session.cwd.clone())),
+            )
+        } else if let Some(session) = existing_session.as_ref() {
+            (
+                Some(session.program.clone()),
+                session.args.clone(),
+                SessionShellKind::Default,
+                payload.env.clone(),
+                Some(session.title.clone()),
+                payload.cwd.clone().or_else(|| Some(session.cwd.clone())),
+            )
+        } else {
+            return Err(TmuxHttpError {
+                status: 400,
+                message: "Pane has no prior session to respawn; provide a command".to_string(),
+            });
+        };
 
     let (_snapshot, session) = spawn_session_in_stack(
         state.tmux.app_handle.clone(),
@@ -4607,11 +4618,9 @@ fn tmux_respawn_window(
     payload: RespawnWindowRequest,
 ) -> Result<serde_json::Value, TmuxHttpError> {
     let context = normalize_tmux_context(state, context)?;
-    let snapshot = load_workspace_session_snapshot(
-        state,
-        &context.project_id,
-        &context.workspace_session_id,
-    ).map_err(internal_error)?;
+    let snapshot =
+        load_workspace_session_snapshot(state, &context.project_id, &context.workspace_session_id)
+            .map_err(internal_error)?;
     let target_window_id = resolve_target_window_id(
         &snapshot,
         payload.target.as_deref(),
@@ -4652,34 +4661,37 @@ fn tmux_respawn_window(
             .map(|session| session.launch_profile.clone())
             .unwrap_or_else(|| context.launch_profile.clone());
 
-        let Some((program, args, shell_kind, env_overrides, title, cwd)) = (if let Some(command) = command_override {
-            let launch_spec = build_tmux_child_launch_spec(state, Some(command)).map_err(internal_error)?;
-            Some((
-                Some(launch_spec.program),
-                launch_spec.args,
-                launch_spec.shell_kind,
-                merge_env_maps(Some(launch_spec.env_overrides), payload.env.clone()),
-                existing_session
-                    .as_ref()
-                    .map(|session| session.title.clone())
-                    .or_else(|| Some("tmux-respawn".to_string())),
-                payload
-                    .cwd
-                    .clone()
-                    .or_else(|| existing_session.as_ref().map(|session| session.cwd.clone())),
-            ))
-        } else {
-            existing_session.as_ref().map(|session| {
-                (
-                    Some(session.program.clone()),
-                    session.args.clone(),
-                    SessionShellKind::Default,
-                    payload.env.clone(),
-                    Some(session.title.clone()),
-                    payload.cwd.clone().or_else(|| Some(session.cwd.clone())),
-                )
+        let Some((program, args, shell_kind, env_overrides, title, cwd)) =
+            (if let Some(command) = command_override {
+                let launch_spec =
+                    build_tmux_child_launch_spec(state, Some(command)).map_err(internal_error)?;
+                Some((
+                    Some(launch_spec.program),
+                    launch_spec.args,
+                    launch_spec.shell_kind,
+                    merge_env_maps(Some(launch_spec.env_overrides), payload.env.clone()),
+                    existing_session
+                        .as_ref()
+                        .map(|session| session.title.clone())
+                        .or_else(|| Some("tmux-respawn".to_string())),
+                    payload
+                        .cwd
+                        .clone()
+                        .or_else(|| existing_session.as_ref().map(|session| session.cwd.clone())),
+                ))
+            } else {
+                existing_session.as_ref().map(|session| {
+                    (
+                        Some(session.program.clone()),
+                        session.args.clone(),
+                        SessionShellKind::Default,
+                        payload.env.clone(),
+                        Some(session.title.clone()),
+                        payload.cwd.clone().or_else(|| Some(session.cwd.clone())),
+                    )
+                })
             })
-        }) else {
+        else {
             continue;
         };
 
@@ -4729,11 +4741,9 @@ fn tmux_break_pane(
     payload: BreakPaneRequest,
 ) -> Result<serde_json::Value, TmuxHttpError> {
     let context = normalize_tmux_context(state, context)?;
-    let mut snapshot = load_workspace_session_snapshot(
-        state,
-        &context.project_id,
-        &context.workspace_session_id,
-    ).map_err(internal_error)?;
+    let mut snapshot =
+        load_workspace_session_snapshot(state, &context.project_id, &context.workspace_session_id)
+            .map_err(internal_error)?;
     let (source_tab_id, source_pane_id) = resolve_target_pane_ref(
         &snapshot,
         payload.source.as_deref(),
@@ -4744,8 +4754,8 @@ fn tmux_break_pane(
     let pane_title = session_record_for_pane(&snapshot, &source_tab_id, &source_pane_id)
         .map(|session| session.title)
         .unwrap_or_else(|| "tmux-window".to_string());
-    let detached_stack =
-        detach_pane_from_snapshot(&mut snapshot, &source_tab_id, &source_pane_id).map_err(internal_error)?;
+    let detached_stack = detach_pane_from_snapshot(&mut snapshot, &source_tab_id, &source_pane_id)
+        .map_err(internal_error)?;
     let mut new_tab = WorkspaceTab {
         id: Uuid::new_v4().to_string(),
         title: payload.name.unwrap_or(pane_title),
@@ -4767,7 +4777,11 @@ fn tmux_break_pane(
             .iter()
             .position(|tab| tab.id == target_window_id)
             .unwrap_or(snapshot.tabs.len());
-        if payload.before { target_index } else { target_index + 1 }
+        if payload.before {
+            target_index
+        } else {
+            target_index + 1
+        }
     } else {
         snapshot.tabs.len()
     }
@@ -4779,7 +4793,11 @@ fn tmux_break_pane(
         snapshot.active_tab_id = Some(new_tab_id.clone());
         state
             .tmux
-            .update_session_focus(&context.session_id, new_tab_id.clone(), source_pane_id.clone())
+            .update_session_focus(
+                &context.session_id,
+                new_tab_id.clone(),
+                source_pane_id.clone(),
+            )
             .map_err(internal_error)?;
     }
 
@@ -4799,11 +4817,9 @@ fn tmux_join_pane(
     payload: JoinPaneRequest,
 ) -> Result<serde_json::Value, TmuxHttpError> {
     let context = normalize_tmux_context(state, context)?;
-    let mut snapshot = load_workspace_session_snapshot(
-        state,
-        &context.project_id,
-        &context.workspace_session_id,
-    ).map_err(internal_error)?;
+    let mut snapshot =
+        load_workspace_session_snapshot(state, &context.project_id, &context.workspace_session_id)
+            .map_err(internal_error)?;
     let (source_tab_id, source_pane_id) = resolve_target_pane_ref(
         &snapshot,
         payload.source.as_deref(),
@@ -4825,8 +4841,8 @@ fn tmux_join_pane(
         });
     }
 
-    let detached_stack =
-        detach_pane_from_snapshot(&mut snapshot, &source_tab_id, &source_pane_id).map_err(internal_error)?;
+    let detached_stack = detach_pane_from_snapshot(&mut snapshot, &source_tab_id, &source_pane_id)
+        .map_err(internal_error)?;
     let direction = resolve_tmux_split_direction(payload.direction.as_deref());
     let insertion = if payload.before {
         SplitInsertion::Before
@@ -4880,7 +4896,11 @@ fn tmux_join_pane(
         snapshot.active_tab_id = Some(target_tab_id.clone());
         state
             .tmux
-            .update_session_focus(&context.session_id, target_tab_id.clone(), source_pane_id.clone())
+            .update_session_focus(
+                &context.session_id,
+                target_tab_id.clone(),
+                source_pane_id.clone(),
+            )
             .map_err(internal_error)?;
     }
 
@@ -4900,11 +4920,9 @@ fn tmux_swap_pane(
     payload: SwapPaneRequest,
 ) -> Result<(), TmuxHttpError> {
     let context = normalize_tmux_context(state, context)?;
-    let mut snapshot = load_workspace_session_snapshot(
-        state,
-        &context.project_id,
-        &context.workspace_session_id,
-    ).map_err(internal_error)?;
+    let mut snapshot =
+        load_workspace_session_snapshot(state, &context.project_id, &context.workspace_session_id)
+            .map_err(internal_error)?;
     let (source_tab_id, source_pane_id) = resolve_target_pane_ref(
         &snapshot,
         payload.source.as_deref(),
@@ -5017,11 +5035,9 @@ fn tmux_swap_window(
     payload: SwapWindowRequest,
 ) -> Result<(), TmuxHttpError> {
     let context = normalize_tmux_context(state, context)?;
-    let mut snapshot = load_workspace_session_snapshot(
-        state,
-        &context.project_id,
-        &context.workspace_session_id,
-    ).map_err(internal_error)?;
+    let mut snapshot =
+        load_workspace_session_snapshot(state, &context.project_id, &context.workspace_session_id)
+            .map_err(internal_error)?;
     let source_window_id = resolve_target_window_id(
         &snapshot,
         payload.source.as_deref(),
@@ -5070,11 +5086,9 @@ fn tmux_rotate_window(
     payload: RotateWindowRequest,
 ) -> Result<(), TmuxHttpError> {
     let context = normalize_tmux_context(state, context)?;
-    let mut snapshot = load_workspace_session_snapshot(
-        state,
-        &context.project_id,
-        &context.workspace_session_id,
-    ).map_err(internal_error)?;
+    let mut snapshot =
+        load_workspace_session_snapshot(state, &context.project_id, &context.workspace_session_id)
+            .map_err(internal_error)?;
     let target_window_id = resolve_target_window_id(
         &snapshot,
         payload.target.as_deref(),
@@ -5104,7 +5118,10 @@ fn tmux_rotate_window(
         })
         .collect::<Result<Vec<_>, _>>()?;
 
-    if matches!(payload.direction.as_deref(), Some("down") | Some("backward")) {
+    if matches!(
+        payload.direction.as_deref(),
+        Some("down") | Some("backward")
+    ) {
         rotated_nodes.rotate_right(1);
     } else {
         rotated_nodes.rotate_left(1);
@@ -5127,11 +5144,9 @@ fn tmux_move_window(
     payload: MoveWindowRequest,
 ) -> Result<(), TmuxHttpError> {
     let context = normalize_tmux_context(state, context)?;
-    let mut snapshot = load_workspace_session_snapshot(
-        state,
-        &context.project_id,
-        &context.workspace_session_id,
-    ).map_err(internal_error)?;
+    let mut snapshot =
+        load_workspace_session_snapshot(state, &context.project_id, &context.workspace_session_id)
+            .map_err(internal_error)?;
     let source_window_id = resolve_target_window_id(
         &snapshot,
         payload.source.as_deref(),
@@ -5147,8 +5162,13 @@ fn tmux_move_window(
             message: "Source window not found".to_string(),
         })?;
     let tab = snapshot.tabs.remove(source_index);
-    let insert_index = resolve_move_window_insert_index(&snapshot, payload.target.as_deref(), payload.before, payload.after)?
-        .min(snapshot.tabs.len());
+    let insert_index = resolve_move_window_insert_index(
+        &snapshot,
+        payload.target.as_deref(),
+        payload.before,
+        payload.after,
+    )?
+    .min(snapshot.tabs.len());
     snapshot.tabs.insert(insert_index, tab);
     if !payload.detached {
         snapshot.active_tab_id = Some(source_window_id.clone());
@@ -5165,11 +5185,9 @@ fn tmux_pipe_pane(
     payload: PipePaneRequest,
 ) -> Result<(), TmuxHttpError> {
     let context = normalize_tmux_context(state, context)?;
-    let snapshot = load_workspace_session_snapshot(
-        state,
-        &context.project_id,
-        &context.workspace_session_id,
-    ).map_err(internal_error)?;
+    let snapshot =
+        load_workspace_session_snapshot(state, &context.project_id, &context.workspace_session_id)
+            .map_err(internal_error)?;
     let (tab_id, pane_id) = resolve_target_pane_ref(
         &snapshot,
         payload.target.as_deref(),
@@ -5177,14 +5195,16 @@ fn tmux_pipe_pane(
         &context.current_pane_id,
         context.previous_tab_id.as_deref(),
     )?;
-    let session = session_record_for_pane(&snapshot, &tab_id, &pane_id).ok_or_else(|| {
-        TmuxHttpError {
+    let session =
+        session_record_for_pane(&snapshot, &tab_id, &pane_id).ok_or_else(|| TmuxHttpError {
             status: 404,
             message: "Target pane has no active session".to_string(),
-        }
-    })?;
+        })?;
 
-    if !matches!(session.status, SessionStatus::Running | SessionStatus::Starting) {
+    if !matches!(
+        session.status,
+        SessionStatus::Running | SessionStatus::Starting
+    ) {
         return Err(TmuxHttpError {
             status: 409,
             message: "Target pane is not running".to_string(),
@@ -5235,12 +5255,12 @@ fn tmux_kill_pane(
 ) -> Result<(), TmuxHttpError> {
     let context = normalize_tmux_context(state, context)?;
     let (session_ids, mut snapshot) = {
-        let mut snapshot =
-            load_workspace_session_snapshot(
-        state,
-        &context.project_id,
-        &context.workspace_session_id,
-    ).map_err(internal_error)?;
+        let mut snapshot = load_workspace_session_snapshot(
+            state,
+            &context.project_id,
+            &context.workspace_session_id,
+        )
+        .map_err(internal_error)?;
         let Some(tab) = snapshot
             .tabs
             .iter()
@@ -5288,11 +5308,9 @@ fn tmux_capture_pane(
     payload: CapturePaneRequest,
 ) -> Result<String, TmuxHttpError> {
     let context = normalize_tmux_context(state, context)?;
-    let snapshot = load_workspace_session_snapshot(
-        state,
-        &context.project_id,
-        &context.workspace_session_id,
-    ).map_err(internal_error)?;
+    let snapshot =
+        load_workspace_session_snapshot(state, &context.project_id, &context.workspace_session_id)
+            .map_err(internal_error)?;
     let Some(tab) = snapshot
         .tabs
         .iter()
@@ -5329,11 +5347,8 @@ fn tmux_resize_pane(
 ) -> Result<(), TmuxHttpError> {
     let context = normalize_tmux_context(state, context)?;
     let mut snapshot =
-        load_workspace_session_snapshot(
-        state,
-        &context.project_id,
-        &context.workspace_session_id,
-    ).map_err(internal_error)?;
+        load_workspace_session_snapshot(state, &context.project_id, &context.workspace_session_id)
+            .map_err(internal_error)?;
     let Some(tab) = snapshot
         .tabs
         .iter_mut()
@@ -5350,7 +5365,14 @@ fn tmux_resize_pane(
         .tab_viewports
         .lock()
         .ok()
-        .and_then(|cache| cache.get(&tab_viewport_key(&context.project_id, &context.current_tab_id)).copied())
+        .and_then(|cache| {
+            cache
+                .get(&tab_viewport_key(
+                    &context.project_id,
+                    &context.current_tab_id,
+                ))
+                .copied()
+        })
         .unwrap_or(TabViewport {
             width: 160.0,
             height: 90.0,
@@ -5373,19 +5395,23 @@ fn tmux_kill_window(
     let context = normalize_tmux_context(state, context)?;
 
     let (session_ids, mut snapshot) = {
-        let mut snapshot =
-            load_workspace_session_snapshot(
-        state,
-        &context.project_id,
-        &context.workspace_session_id,
-    ).map_err(internal_error)?;
+        let mut snapshot = load_workspace_session_snapshot(
+            state,
+            &context.project_id,
+            &context.workspace_session_id,
+        )
+        .map_err(internal_error)?;
         let target_window_id = resolve_target_window_id(
             &snapshot,
             target,
             &context.current_tab_id,
             context.previous_tab_id.as_deref(),
         )?;
-        let Some(tab_index) = snapshot.tabs.iter().position(|tab| tab.id == target_window_id) else {
+        let Some(tab_index) = snapshot
+            .tabs
+            .iter()
+            .position(|tab| tab.id == target_window_id)
+        else {
             return Err(TmuxHttpError {
                 status: 404,
                 message: "Target window not found".to_string(),
@@ -5436,11 +5462,8 @@ fn tmux_select_pane(
     let context = normalize_tmux_context(state, context)?;
 
     let mut snapshot =
-        load_workspace_session_snapshot(
-        state,
-        &context.project_id,
-        &context.workspace_session_id,
-    ).map_err(internal_error)?;
+        load_workspace_session_snapshot(state, &context.project_id, &context.workspace_session_id)
+            .map_err(internal_error)?;
     let Some(tab) = snapshot
         .tabs
         .iter_mut()
@@ -5475,7 +5498,9 @@ fn tmux_select_pane(
         .update_session_focus(
             &context.session_id,
             context.current_tab_id.clone(),
-            tab.active_pane_id.clone().unwrap_or_else(|| context.current_pane_id.clone()),
+            tab.active_pane_id
+                .clone()
+                .unwrap_or_else(|| context.current_pane_id.clone()),
         )
         .map_err(internal_error)?;
     refresh_snapshot_sessions(state, &mut snapshot).map_err(internal_error)?;
@@ -5491,11 +5516,9 @@ fn tmux_select_window(
 ) -> Result<(), TmuxHttpError> {
     let context = normalize_tmux_context(state, context)?;
 
-    let mut snapshot = load_workspace_session_snapshot(
-        state,
-        &context.project_id,
-        &context.workspace_session_id,
-    ).map_err(internal_error)?;
+    let mut snapshot =
+        load_workspace_session_snapshot(state, &context.project_id, &context.workspace_session_id)
+            .map_err(internal_error)?;
     if snapshot.tabs.is_empty() {
         return Err(TmuxHttpError {
             status: 404,
@@ -5523,11 +5546,7 @@ fn tmux_select_window(
         }
     };
 
-    let Some(target_tab) = snapshot
-        .tabs
-        .iter()
-        .find(|tab| tab.id == target_window_id)
-    else {
+    let Some(target_tab) = snapshot.tabs.iter().find(|tab| tab.id == target_window_id) else {
         return Err(TmuxHttpError {
             status: 404,
             message: "Target window not found".to_string(),
@@ -5559,12 +5578,9 @@ fn tmux_display_message(
     format: &str,
 ) -> Result<String, TmuxHttpError> {
     let context = normalize_tmux_context(state, context)?;
-    let snapshot = load_workspace_session_snapshot(
-        state,
-        &context.project_id,
-        &context.workspace_session_id,
-    )
-    .map_err(internal_error)?;
+    let snapshot =
+        load_workspace_session_snapshot(state, &context.project_id, &context.workspace_session_id)
+            .map_err(internal_error)?;
     let session_name = tmux_session_name(state, &context.project_id, &context.workspace_session_id)
         .map_err(internal_error)?;
     let tab_index = snapshot
@@ -5652,7 +5668,9 @@ fn resolve_target_window_id(
         return Ok(current_tab_id.to_string());
     }
 
-    if let Some(relative) = resolve_window_target_alias(snapshot, &token, current_tab_id, previous_tab_id)? {
+    if let Some(relative) =
+        resolve_window_target_alias(snapshot, &token, current_tab_id, previous_tab_id)?
+    {
         return Ok(relative);
     }
 
@@ -5700,7 +5718,9 @@ fn resolve_target_pane_ref(
     }
 
     let has_window_component = trimmed.contains(':') || trimmed.contains('.');
-    let target_tab_id = if has_window_component && extract_window_target_token(trimmed) != extract_target_token(trimmed) {
+    let target_tab_id = if has_window_component
+        && extract_window_target_token(trimmed) != extract_target_token(trimmed)
+    {
         resolve_target_window_id(snapshot, Some(trimmed), current_tab_id, previous_tab_id)?
     } else {
         current_tab_id.to_string()
@@ -5715,19 +5735,23 @@ fn resolve_target_pane_ref(
         })?;
 
     let pane_target = extract_target_token(trimmed);
-    let target_pane_id = if has_window_component && pane_target == extract_window_target_token(trimmed) {
-        current_tmux_pane_id(tab, &first_stack_id(&tab.root).unwrap_or_else(|| current_pane_id.to_string()))
-    } else {
-        let fallback = if target_tab_id == current_tab_id {
-            current_pane_id.to_string()
-        } else {
+    let target_pane_id =
+        if has_window_component && pane_target == extract_window_target_token(trimmed) {
             current_tmux_pane_id(
                 tab,
                 &first_stack_id(&tab.root).unwrap_or_else(|| current_pane_id.to_string()),
             )
+        } else {
+            let fallback = if target_tab_id == current_tab_id {
+                current_pane_id.to_string()
+            } else {
+                current_tmux_pane_id(
+                    tab,
+                    &first_stack_id(&tab.root).unwrap_or_else(|| current_pane_id.to_string()),
+                )
+            };
+            resolve_target_pane_id(tab, Some(trimmed), &fallback)?
         };
-        resolve_target_pane_id(tab, Some(trimmed), &fallback)?
-    };
 
     Ok((target_tab_id, target_pane_id))
 }
@@ -6007,33 +6031,29 @@ fn apply_tmux_resize_to_tab(
     if let Some(width) = payload.width {
         let current_units = target_rect.rect.width * viewport.width.max(1.0);
         let delta_units = width as f64 - current_units;
-        return Ok(
-            try_resize_with_edges(
-                &mut tab.root,
-                target_pane_id,
-                "horizontal",
-                &[ResizeEdge::Forward, ResizeEdge::Backward],
-                delta_units,
-                root_rect,
-                viewport,
-            ),
-        );
+        return Ok(try_resize_with_edges(
+            &mut tab.root,
+            target_pane_id,
+            "horizontal",
+            &[ResizeEdge::Forward, ResizeEdge::Backward],
+            delta_units,
+            root_rect,
+            viewport,
+        ));
     }
 
     if let Some(height) = payload.height {
         let current_units = target_rect.rect.height * viewport.height.max(1.0);
         let delta_units = height as f64 - current_units;
-        return Ok(
-            try_resize_with_edges(
-                &mut tab.root,
-                target_pane_id,
-                "vertical",
-                &[ResizeEdge::Forward, ResizeEdge::Backward],
-                delta_units,
-                root_rect,
-                viewport,
-            ),
-        );
+        return Ok(try_resize_with_edges(
+            &mut tab.root,
+            target_pane_id,
+            "vertical",
+            &[ResizeEdge::Forward, ResizeEdge::Backward],
+            delta_units,
+            root_rect,
+            viewport,
+        ));
     }
 
     let adjustment = payload.adjustment.unwrap_or(1) as f64;
@@ -6169,11 +6189,7 @@ fn split_child_rects(
     let mut result = Vec::with_capacity(child_count);
     let mut offset = 0.0;
     for index in 0..child_count {
-        let ratio = sizes
-            .get(index)
-            .copied()
-            .unwrap_or((100 / count) as u16) as f64
-            / 100.0;
+        let ratio = sizes.get(index).copied().unwrap_or((100 / count) as u16) as f64 / 100.0;
         let child_rect = if direction == "vertical" {
             NormalizedRect {
                 x: rect.x,
@@ -6201,13 +6217,18 @@ fn adjust_split_sizes(
     sibling_index: usize,
     delta_percent: f64,
 ) -> bool {
-    if target_index >= sizes.len() || sibling_index >= sizes.len() || target_index == sibling_index {
+    if target_index >= sizes.len() || sibling_index >= sizes.len() || target_index == sibling_index
+    {
         return false;
     }
 
     let mut delta = delta_percent.round() as i32;
     if delta == 0 {
-        delta = if delta_percent.is_sign_negative() { -1 } else { 1 };
+        delta = if delta_percent.is_sign_negative() {
+            -1
+        } else {
+            1
+        };
     }
 
     let target_size = sizes[target_index] as i32;
@@ -6236,7 +6257,9 @@ fn find_pane_rect(node: &models::LayoutNode, target_pane_id: &str) -> Option<Pan
         },
         &mut panes,
     );
-    panes.into_iter().find(|pane| pane.pane_id == target_pane_id)
+    panes
+        .into_iter()
+        .find(|pane| pane.pane_id == target_pane_id)
 }
 
 fn resolve_directional_pane_id(
@@ -6265,7 +6288,10 @@ fn resolve_directional_pane_id(
         })?;
 
     let mut best: Option<(String, f64, f64)> = None;
-    for pane in panes.into_iter().filter(|pane| pane.pane_id != current_pane_id) {
+    for pane in panes
+        .into_iter()
+        .filter(|pane| pane.pane_id != current_pane_id)
+    {
         let distance = directional_distance(&current.rect, &pane.rect, direction);
         let overlap = directional_overlap(&current.rect, &pane.rect, direction);
         let Some(distance) = distance else {
@@ -6285,13 +6311,18 @@ fn resolve_directional_pane_id(
         }
     }
 
-    best.map(|(pane_id, _, _)| pane_id).ok_or_else(|| TmuxHttpError {
-        status: 404,
-        message: format!("No pane found in direction '{direction}'"),
-    })
+    best.map(|(pane_id, _, _)| pane_id)
+        .ok_or_else(|| TmuxHttpError {
+            status: 404,
+            message: format!("No pane found in direction '{direction}'"),
+        })
 }
 
-fn directional_distance(current: &NormalizedRect, candidate: &NormalizedRect, direction: &str) -> Option<f64> {
+fn directional_distance(
+    current: &NormalizedRect,
+    candidate: &NormalizedRect,
+    direction: &str,
+) -> Option<f64> {
     let current_right = current.x + current.width;
     let current_bottom = current.y + current.height;
     let candidate_right = candidate.x + candidate.width;
@@ -6305,7 +6336,11 @@ fn directional_distance(current: &NormalizedRect, candidate: &NormalizedRect, di
     }
 }
 
-fn directional_overlap(current: &NormalizedRect, candidate: &NormalizedRect, direction: &str) -> f64 {
+fn directional_overlap(
+    current: &NormalizedRect,
+    candidate: &NormalizedRect,
+    direction: &str,
+) -> f64 {
     match direction {
         "left" | "right" => axis_overlap(
             current.y,
@@ -6327,11 +6362,7 @@ fn axis_overlap(a_start: f64, a_end: f64, b_start: f64, b_end: f64) -> f64 {
     (a_end.min(b_end) - a_start.max(b_start)).max(0.0)
 }
 
-fn collect_pane_rects(
-    node: &models::LayoutNode,
-    rect: NormalizedRect,
-    panes: &mut Vec<PaneRect>,
-) {
+fn collect_pane_rects(node: &models::LayoutNode, rect: NormalizedRect, panes: &mut Vec<PaneRect>) {
     match node {
         models::LayoutNode::Stack { id, .. } => panes.push(PaneRect {
             pane_id: id.clone(),
@@ -6390,7 +6421,10 @@ fn collect_stack_ids_into(node: &models::LayoutNode, stack_ids: &mut Vec<String>
     }
 }
 
-fn clone_stack_node(node: &models::LayoutNode, target_stack_id: &str) -> Option<models::LayoutNode> {
+fn clone_stack_node(
+    node: &models::LayoutNode,
+    target_stack_id: &str,
+) -> Option<models::LayoutNode> {
     match node {
         models::LayoutNode::Stack { id, .. } if id == target_stack_id => Some(node.clone()),
         models::LayoutNode::Split { children, .. } => children
@@ -6459,7 +6493,10 @@ fn insert_existing_stack_node(
     }
 }
 
-fn split_sizes_for_existing_child(new_child_size: Option<u16>, insertion: SplitInsertion) -> Vec<u16> {
+fn split_sizes_for_existing_child(
+    new_child_size: Option<u16>,
+    insertion: SplitInsertion,
+) -> Vec<u16> {
     let Some(new_child_size) = new_child_size.map(|size| size.clamp(1, 99)) else {
         return vec![50, 50];
     };
@@ -6634,11 +6671,8 @@ fn tmux_pane_listing(
     context: &TmuxTokenContext,
     target_pane_id: &str,
 ) -> Result<PaneListing, String> {
-    let snapshot = load_workspace_session_snapshot(
-        state,
-        &context.project_id,
-        &context.workspace_session_id,
-    )?;
+    let snapshot =
+        load_workspace_session_snapshot(state, &context.project_id, &context.workspace_session_id)?;
     let tab_index = snapshot
         .tabs
         .iter()
@@ -6768,7 +6802,13 @@ fn next_tmux_buffer_name(buffers: &HashMap<String, String>) -> String {
 }
 
 fn render_tmux_buffer_format(format: &str, name: &str, value: &str) -> String {
-    let sample = value.lines().next().unwrap_or(value).chars().take(32).collect::<String>();
+    let sample = value
+        .lines()
+        .next()
+        .unwrap_or(value)
+        .chars()
+        .take(32)
+        .collect::<String>();
     let mut result = format.to_string();
     result = result.replace("#{buffer_name}", name);
     result = result.replace("#{buffer_size}", &value.len().to_string());
@@ -6895,7 +6935,8 @@ fn read_windows_clipboard_file_paths() -> Result<Option<Vec<String>>, String> {
                 }
 
                 let mut buffer = vec![0_u16; length as usize + 1];
-                let copied = DragQueryFileW(handle as _, index, buffer.as_mut_ptr(), buffer.len() as u32);
+                let copied =
+                    DragQueryFileW(handle as _, index, buffer.as_mut_ptr(), buffer.len() as u32);
                 if copied == 0 {
                     continue;
                 }
@@ -7069,7 +7110,11 @@ fn ensure_session_spawn_target(
             .ok_or_else(|| "Window not found".to_string())?,
     };
 
-    let Some(target_window) = snapshot.tabs.iter_mut().find(|tab| tab.id == resolved_window_id) else {
+    let Some(target_window) = snapshot
+        .tabs
+        .iter_mut()
+        .find(|tab| tab.id == resolved_window_id)
+    else {
         return Err("Window not found".to_string());
     };
 
@@ -7104,16 +7149,15 @@ fn ensure_session_spawn_target(
 mod tests {
     use super::{
         ClientListing, ResizePaneRequest, SessionListing, TabViewport, WindowListing,
-        WorkspaceSnapshot, apply_tmux_resize_to_tab, close_pane_in_snapshot,
-        current_tmux_pane_id, map_window_error_to_tab, query_flag,
-        remove_session_from_snapshot, rename_window_in_snapshot,
-        render_tmux_client_format, render_tmux_session_format, render_tmux_window_format,
-        resolve_directional_pane_id, resolve_relative_window_id, resolve_target_window_id,
-        resolve_tmux_split_direction, set_active_window_in_snapshot, split_tmux_pane,
-        ensure_workspace_snapshot_has_window,
+        WorkspaceSnapshot, apply_tmux_resize_to_tab, close_pane_in_snapshot, current_tmux_pane_id,
+        ensure_workspace_snapshot_has_window, map_window_error_to_tab, query_flag,
+        remove_session_from_snapshot, rename_window_in_snapshot, render_tmux_client_format,
+        render_tmux_session_format, render_tmux_window_format, resolve_directional_pane_id,
+        resolve_relative_window_id, resolve_target_window_id, resolve_tmux_split_direction,
+        set_active_window_in_snapshot, split_tmux_pane,
     };
-    use crate::layout::{add_session_to_stack, first_stack_id, new_workspace_tab};
     use crate::layout::SplitInsertion;
+    use crate::layout::{add_session_to_stack, first_stack_id, new_workspace_tab};
     use crate::models::{LayoutNode, PaneCreatedBy, PaneLaunchState};
 
     #[test]
@@ -7291,12 +7335,9 @@ mod tests {
             sessions: Vec::new(),
         };
 
-        let error = rename_window_in_snapshot(
-            &mut snapshot,
-            "missing-window",
-            "renamed".to_string(),
-        )
-        .expect_err("missing");
+        let error =
+            rename_window_in_snapshot(&mut snapshot, "missing-window", "renamed".to_string())
+                .expect_err("missing");
         assert_eq!(error, "Window not found");
     }
 
@@ -7609,4 +7650,3 @@ mod tests {
         }
     }
 }
-

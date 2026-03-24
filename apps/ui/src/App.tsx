@@ -30,6 +30,7 @@ import {
   movePane,
   openProject,
   openSession,
+  reorderProjects,
   renameProject,
   renameWindow,
   renameWorkspaceSession,
@@ -83,6 +84,7 @@ type PaneMoveMenuState = {
 };
 
 type DirectionalPaneMovePlacement = Exclude<PaneMovePlacement, "swap">;
+type ProjectDropPlacement = "before" | "after";
 
 const launcherRows: LauncherProfile[][] = [
   [
@@ -173,6 +175,25 @@ function resolveDropPlacementFromRect(rect: DOMRect, clientX: number, clientY: n
   return "swap";
 }
 
+function resolveProjectDropPlacementFromRect(rect: DOMRect, clientY: number): ProjectDropPlacement {
+  return clientY <= rect.top + rect.height / 2 ? "before" : "after";
+}
+
+function reorderProjectList(projects: Project[], sourceProjectId: string, targetProjectId: string, placement: ProjectDropPlacement) {
+  const sourceIndex = projects.findIndex((project) => project.id === sourceProjectId);
+  const targetIndex = projects.findIndex((project) => project.id === targetProjectId);
+  if (sourceIndex < 0 || targetIndex < 0 || sourceProjectId === targetProjectId) {
+    return projects;
+  }
+
+  const nextProjects = [...projects];
+  const [movedProject] = nextProjects.splice(sourceIndex, 1);
+  const insertionTargetIndex = nextProjects.findIndex((project) => project.id === targetProjectId);
+  const insertionIndex = insertionTargetIndex + (placement === "after" ? 1 : 0);
+  nextProjects.splice(insertionIndex, 0, movedProject);
+  return nextProjects;
+}
+
 function withTimeout<T>(promise: Promise<T>, timeoutMs: number, timeoutMessage: string) {
   let timeoutId: number | null = null;
   const timeoutPromise = new Promise<T>((_resolve, reject) => {
@@ -212,15 +233,21 @@ export default function App() {
   const [sidebarStatus, setSidebarStatus] = useState<SessionSidebarStatus | null>(null);
   const [draggingPaneId, setDraggingPaneId] = useState<string | null>(null);
   const [dragTarget, setDragTarget] = useState<{ paneId: string; placement: PaneMovePlacement } | null>(null);
+  const [draggingProjectId, setDraggingProjectId] = useState<string | null>(null);
+  const [projectDragTarget, setProjectDragTarget] = useState<{ projectId: string; placement: ProjectDropPlacement } | null>(null);
   const workspaceCanvasRef = useRef<HTMLElement | null>(null);
+  const projectsRef = useRef<Project[]>([]);
   const activeProjectIdRef = useRef<string | null>(null);
   const activeWorkspaceSessionIdRef = useRef<string | null>(null);
   const activeTerminalSessionIdRef = useRef<string | null>(null);
   const draggingPaneIdRef = useRef<string | null>(null);
+  const draggingProjectIdRef = useRef<string | null>(null);
   const selectionRequestSeqRef = useRef(0);
   const workspaceMutationSeqRef = useRef(0);
   const dragPointerIdRef = useRef<number | null>(null);
   const dragHandleElementRef = useRef<HTMLElement | null>(null);
+  const projectDragPointerIdRef = useRef<number | null>(null);
+  const projectDragHandleElementRef = useRef<HTMLElement | null>(null);
   const refreshProjectSummaryRef = useRef<(projectId: string) => Promise<void>>(async () => {});
   const refreshCurrentSelectionRef = useRef<() => Promise<void>>(async () => {});
   const movePaneWithinWindowRef = useRef<(sourcePaneId: string, targetPaneId: string, placement: PaneMovePlacement) => Promise<void>>(async () => {});
@@ -245,6 +272,10 @@ export default function App() {
   );
   const activeTerminalSessionId = activeTerminalSession?.id ?? null;
   useEffect(() => {
+    projectsRef.current = projects;
+  }, [projects]);
+
+  useEffect(() => {
     activeProjectIdRef.current = activeProjectId;
   }, [activeProjectId]);
 
@@ -255,6 +286,10 @@ export default function App() {
   useEffect(() => {
     draggingPaneIdRef.current = draggingPaneId;
   }, [draggingPaneId]);
+
+  useEffect(() => {
+    draggingProjectIdRef.current = draggingProjectId;
+  }, [draggingProjectId]);
 
   useEffect(() => {
     activeTerminalSessionIdRef.current = activeTerminalSessionId;
@@ -664,6 +699,114 @@ export default function App() {
     };
   }, [draggingPaneId]);
 
+  useEffect(() => {
+    if (!draggingProjectId) {
+      return;
+    }
+    const pointerId = projectDragPointerIdRef.current;
+
+    const getCurrentDropTarget = (clientX: number, clientY: number) =>
+      getProjectDropTargetFromPoint(clientX, clientY, draggingProjectId);
+
+    const isPointerMatch = (event: PointerEvent) => pointerId === null || event.pointerId === pointerId;
+
+    const clearProjectDragState = () => {
+      const dragHandle = projectDragHandleElementRef.current;
+      const activePointerId = projectDragPointerIdRef.current;
+      if (dragHandle && activePointerId !== null) {
+        try {
+          if (dragHandle.hasPointerCapture(activePointerId)) {
+            dragHandle.releasePointerCapture(activePointerId);
+          }
+        } catch {
+          // no-op: release may fail when capture is already gone.
+        }
+      }
+      projectDragHandleElementRef.current = null;
+      projectDragPointerIdRef.current = null;
+      setDraggingProjectId(null);
+      setProjectDragTarget(null);
+    };
+
+    const handlePointerMove = (event: PointerEvent) => {
+      if (!isPointerMatch(event)) {
+        return;
+      }
+      const nextTarget = getCurrentDropTarget(event.clientX, event.clientY);
+      setProjectDragTarget((current) => {
+        if (!nextTarget) {
+          return null;
+        }
+        if (current?.projectId === nextTarget.projectId && current.placement === nextTarget.placement) {
+          return current;
+        }
+        return nextTarget;
+      });
+    };
+
+    const handlePointerUp = (event: PointerEvent) => {
+      if (!isPointerMatch(event)) {
+        return;
+      }
+      const finalTarget = getCurrentDropTarget(event.clientX, event.clientY);
+      const sourceProjectId = draggingProjectIdRef.current;
+      const previousProjects = projectsRef.current;
+      clearProjectDragState();
+      if (!sourceProjectId || !finalTarget) {
+        return;
+      }
+      const nextProjects = reorderProjectList(previousProjects, sourceProjectId, finalTarget.projectId, finalTarget.placement);
+      if (nextProjects === previousProjects) {
+        return;
+      }
+      projectsRef.current = nextProjects;
+      setProjects(nextProjects);
+      void reorderProjects(nextProjects.map((project) => project.id))
+        .then((persistedProjects) => {
+          projectsRef.current = persistedProjects;
+          setProjects(persistedProjects);
+        })
+        .catch((error) => {
+          projectsRef.current = previousProjects;
+          setProjects(previousProjects);
+          showError(error);
+        });
+    };
+
+    const handlePointerCancel = (event: PointerEvent) => {
+      if (!isPointerMatch(event)) {
+        return;
+      }
+      clearProjectDragState();
+    };
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") {
+        return;
+      }
+      event.preventDefault();
+      clearProjectDragState();
+    };
+
+    const handleWindowBlur = () => {
+      clearProjectDragState();
+    };
+
+    window.addEventListener("pointermove", handlePointerMove);
+    window.addEventListener("pointerup", handlePointerUp);
+    window.addEventListener("pointercancel", handlePointerCancel);
+    window.addEventListener("keydown", handleKeyDown);
+    window.addEventListener("blur", handleWindowBlur);
+
+    return () => {
+      window.removeEventListener("pointermove", handlePointerMove);
+      window.removeEventListener("pointerup", handlePointerUp);
+      window.removeEventListener("pointercancel", handlePointerCancel);
+      window.removeEventListener("keydown", handleKeyDown);
+      window.removeEventListener("blur", handleWindowBlur);
+    };
+  }, [draggingProjectId]);
+
   async function refreshProjectOnly(projectId: string) {
     const nextProjectSnapshot = await openProject(projectId);
     mergeProjectSnapshot(nextProjectSnapshot);
@@ -873,6 +1016,46 @@ export default function App() {
       x: position.x,
       y: position.y,
     });
+  }
+
+  function getProjectDropTargetFromPoint(clientX: number, clientY: number, sourceProjectId: string) {
+    const target = document.elementFromPoint(clientX, clientY);
+    const groupElement = target instanceof HTMLElement ? target.closest<HTMLElement>("[data-project-id]") : null;
+    const projectId = groupElement?.dataset.projectId;
+    if (!groupElement || !projectId || projectId === sourceProjectId) {
+      return null;
+    }
+    return {
+      projectId,
+      placement: resolveProjectDropPlacementFromRect(groupElement.getBoundingClientRect(), clientY),
+    };
+  }
+
+  function beginProjectDrag(event: ReactPointerEvent<HTMLElement>, projectId: string) {
+    event.preventDefault();
+    event.stopPropagation();
+    const previousHandle = projectDragHandleElementRef.current;
+    const previousPointerId = projectDragPointerIdRef.current;
+    if (previousHandle && previousPointerId !== null) {
+      try {
+        if (previousHandle.hasPointerCapture(previousPointerId)) {
+          previousHandle.releasePointerCapture(previousPointerId);
+        }
+      } catch {
+        // ignore stale pointer capture release errors
+      }
+    }
+    projectDragHandleElementRef.current = event.currentTarget;
+    projectDragPointerIdRef.current = event.pointerId;
+    try {
+      event.currentTarget.setPointerCapture(event.pointerId);
+    } catch {
+      // Some platforms may reject capture when pointer state changed.
+    }
+    setSidebarContextMenu(null);
+    setPaneMoveMenu(null);
+    setDraggingProjectId(projectId);
+    setProjectDragTarget(null);
   }
 
   async function commitProjectRename(projectId: string) {
@@ -1226,8 +1409,13 @@ export default function App() {
           <div className="sidebar-tree">
             {projects.map((project) => {
               const projectSessions = projectSnapshotsById[project.id]?.sessions ?? [];
+              const isProjectDropTarget = projectDragTarget?.projectId === project.id;
               return (
-                <div key={project.id} className={`tree-group ${project.id === activeProjectId ? "active" : ""}`}>
+                <div
+                  key={project.id}
+                  data-project-id={project.id}
+                  className={`tree-group ${project.id === activeProjectId ? "active" : ""} ${draggingProjectId === project.id ? "drag-source" : ""} ${isProjectDropTarget ? `drop-${projectDragTarget?.placement}` : ""}`}
+                >
                   {renamingProjectId === project.id ? (
                     <div className="tree-row tree-row-project tree-row-static">
                       <span className="project-color" style={{ background: project.color }} />
@@ -1266,6 +1454,15 @@ export default function App() {
                           }}
                         >
                           <span className="tree-disclosure-glyph">{">"}</span>
+                        </button>
+                        <button
+                          className="project-drag-handle"
+                          aria-label={`Reorder ${project.name}`}
+                          title="Drag to reorder"
+                          onPointerDown={(event) => beginProjectDrag(event, project.id)}
+                          onClick={(event) => event.stopPropagation()}
+                        >
+                          <span className="project-drag-handle-glyph">::</span>
                         </button>
                         <div className="tree-row-body">
                           <strong>{project.name}</strong>
@@ -1333,7 +1530,7 @@ export default function App() {
                 </div>
                 <div className="sidebar-status-foot">
                   <span>{activeWorkspaceSession?.name ?? "Session"}</span>
-                  <span>{activeWindow?.title ?? "Window"}</span>
+                  <span>{activeWindow?.title ?? "Tab"}</span>
                 </div>
               </>
             ) : activeWorkspaceSession ? (
@@ -1356,23 +1553,32 @@ export default function App() {
               <p className="eyebrow">{activeWorkspaceSession ? "Session Workspace" : "Project Sessions"}</p>
               <h2>{activeWorkspaceSession?.name ?? activeProject?.name ?? "No project selected"}</h2>
             </div>
-            {activeProjectId && activeWorkspaceSession ? (
-              <button className="toolbar-button primary" onClick={() => void refreshSessionSnapshot(createWindow(activeProjectId, activeWorkspaceSession.id))}>New Window</button>
-            ) : null}
           </header>
 
           {activeWorkspaceSession && sessionSnapshot ? (
             <>
               <div className="workspace-tabs">
-                {sessionSnapshot.windows.map((windowTab) => (
-                  <button key={windowTab.id} className={`workspace-tab ${sessionSnapshot.activeWindowId === windowTab.id ? "active" : ""}`} onClick={() => activeProjectId && void refreshSessionSnapshot(setActiveWindow(activeProjectId, activeWorkspaceSession.id, windowTab.id))} onDoubleClick={() => { const nextTitle = window.prompt("Rename window", windowTab.title); if (nextTitle?.trim() && activeProjectId) { void refreshSessionSnapshot(renameWindow(activeProjectId, activeWorkspaceSession.id, windowTab.id, nextTitle.trim())); } }}>
-                    <span>{windowTab.title}</span>
-                    <span className="workspace-tab-close" onClick={(event) => { event.stopPropagation(); if (activeProjectId) { void refreshSessionSnapshot(closeWindow(activeProjectId, activeWorkspaceSession.id, windowTab.id)); } }}>x</span>
+                <div className="workspace-tab-strip">
+                  {sessionSnapshot.windows.map((windowTab) => (
+                    <button key={windowTab.id} className={`workspace-tab ${sessionSnapshot.activeWindowId === windowTab.id ? "active" : ""}`} onClick={() => activeProjectId && void refreshSessionSnapshot(setActiveWindow(activeProjectId, activeWorkspaceSession.id, windowTab.id))} onDoubleClick={() => { const nextTitle = window.prompt("Rename tab", windowTab.title); if (nextTitle?.trim() && activeProjectId) { void refreshSessionSnapshot(renameWindow(activeProjectId, activeWorkspaceSession.id, windowTab.id, nextTitle.trim())); } }}>
+                      <span>{windowTab.title}</span>
+                      <span className="workspace-tab-close" onClick={(event) => { event.stopPropagation(); if (activeProjectId) { void refreshSessionSnapshot(closeWindow(activeProjectId, activeWorkspaceSession.id, windowTab.id)); } }}>x</span>
+                    </button>
+                  ))}
+                </div>
+                {activeProjectId ? (
+                  <button
+                    className="workspace-tab workspace-tab-add"
+                    onClick={() => void refreshSessionSnapshot(createWindow(activeProjectId, activeWorkspaceSession.id))}
+                    title="Create a new tab"
+                  >
+                    <span className="workspace-tab-add-glyph">+</span>
+                    <span>New Tab</span>
                   </button>
-                ))}
+                ) : null}
               </div>
               <section className="workspace-canvas" ref={workspaceCanvasRef}>
-                {loading ? <div className="empty-state">Loading workspace...</div> : activeWindow ? renderNode(activeWindow.root, false) : <div className="empty-state">Preparing session window...</div>}
+                {loading ? <div className="empty-state">Loading workspace...</div> : activeWindow ? renderNode(activeWindow.root, false) : <div className="empty-state">Preparing session tab...</div>}
               </section>
             </>
           ) : (

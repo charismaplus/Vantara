@@ -16,8 +16,8 @@ use tauri::{AppHandle, Emitter, Manager};
 use crate::{
     db::{Database, now_iso},
     models::{
-        LaunchProfile, SessionExitEvent, SessionOutputEvent, SessionSidebarStatus,
-        SessionStatus, SessionStatusProvider, TerminalSession,
+        LaunchProfile, SessionExitEvent, SessionOutputEvent, SessionSidebarStatus, SessionStatus,
+        SessionStatusProvider, TerminalSession,
     },
 };
 
@@ -207,9 +207,11 @@ impl SessionManager {
                             },
                         );
                         if let Some(output_tail) = output_tail {
-                            if let Some(status) =
-                                update_status_from_output(&reader_statuses, &reader_session_id, &output_tail)
-                            {
+                            if let Some(status) = update_status_from_output(
+                                &reader_statuses,
+                                &reader_session_id,
+                                &output_tail,
+                            ) {
                                 let _ = reader_app.emit("session-status-changed", status);
                             }
                         }
@@ -315,7 +317,11 @@ impl SessionManager {
         Ok(())
     }
 
-    pub fn configure_pipe(&self, session_id: &str, options: SessionPipeOptions) -> Result<(), String> {
+    pub fn configure_pipe(
+        &self,
+        session_id: &str,
+        options: SessionPipeOptions,
+    ) -> Result<(), String> {
         let mut runtimes = self
             .runtimes
             .lock()
@@ -725,9 +731,15 @@ fn extract_context_percent(clean_output: &str) -> Option<u8> {
 
 fn extract_last_model_token(clean_output: &str, prefix: &str) -> Option<String> {
     clean_output
-        .split(|ch: char| ch.is_whitespace() || matches!(ch, '"' | '\'' | ',' | '(' | ')' | '[' | ']'))
+        .split(|ch: char| {
+            ch.is_whitespace() || matches!(ch, '"' | '\'' | ',' | '(' | ')' | '[' | ']')
+        })
         .filter(|token| token.starts_with(prefix))
-        .map(|token| token.trim_end_matches(|ch: char| ".:;!?".contains(ch)).to_string())
+        .map(|token| {
+            token
+                .trim_end_matches(|ch: char| ".:;!?".contains(ch))
+                .to_string()
+        })
         .last()
 }
 
@@ -897,7 +909,11 @@ fn push_output_tail(output_tail: &mut String, chunk: &str) {
     }
 }
 
-fn resolve_capture_line_index(total_lines: usize, raw_index: Option<i32>, default_index: i32) -> usize {
+fn resolve_capture_line_index(
+    total_lines: usize,
+    raw_index: Option<i32>,
+    default_index: i32,
+) -> usize {
     if total_lines == 0 {
         return 0;
     }

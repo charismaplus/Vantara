@@ -19,6 +19,7 @@ pub struct Project {
     pub path: String,
     pub color: String,
     pub icon: Option<String>,
+    pub sort_index: i64,
     pub last_opened_at: Option<String>,
     pub created_at: String,
 }

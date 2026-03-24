@@ -26,6 +26,7 @@ impl Database {
               path TEXT NOT NULL UNIQUE,
               color TEXT NOT NULL,
               icon TEXT,
+              sort_index INTEGER,
               last_opened_at TEXT,
               created_at TEXT NOT NULL
             );
@@ -68,8 +69,12 @@ impl Database {
             "ALTER TABLE sessions ADD COLUMN tmux_shim_enabled INTEGER NOT NULL DEFAULT 0",
             [],
         );
-        let _ = conn.execute("ALTER TABLE sessions ADD COLUMN workspace_session_id TEXT", []);
+        let _ = conn.execute(
+            "ALTER TABLE sessions ADD COLUMN workspace_session_id TEXT",
+            [],
+        );
         let _ = conn.execute("ALTER TABLE sessions ADD COLUMN window_id TEXT", []);
+        let _ = conn.execute("ALTER TABLE projects ADD COLUMN sort_index INTEGER", []);
         let _ = conn.execute(
             "ALTER TABLE workspace_sessions ADD COLUMN created_by TEXT NOT NULL DEFAULT 'user'",
             [],
@@ -83,6 +88,9 @@ impl Database {
             [],
         );
 
+        prune_invalid_legacy_sessions(&conn)?;
+        ensure_project_sort_indexes(&conn)?;
+
         Ok(Self { conn })
     }
 
@@ -90,8 +98,9 @@ impl Database {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT id, name, path, color, icon, last_opened_at, created_at
-                 FROM projects ORDER BY COALESCE(last_opened_at, created_at) DESC, name ASC",
+                "SELECT id, name, path, color, icon, sort_index, last_opened_at, created_at
+                 FROM projects
+                 ORDER BY COALESCE(sort_index, 9223372036854775807) ASC, created_at DESC, name ASC",
             )
             .map_err(|err| err.to_string())?;
 
@@ -103,8 +112,9 @@ impl Database {
                     path: row.get(2)?,
                     color: row.get(3)?,
                     icon: row.get(4)?,
-                    last_opened_at: row.get(5)?,
-                    created_at: row.get(6)?,
+                    sort_index: row.get(5)?,
+                    last_opened_at: row.get(6)?,
+                    created_at: row.get(7)?,
                 })
             })
             .map_err(|err| err.to_string())?;
@@ -113,24 +123,40 @@ impl Database {
             .map_err(|err| err.to_string())
     }
 
-    pub fn create_project(&self, name: &str, path: &str) -> Result<Project, String> {
+    pub fn create_project(&mut self, name: &str, path: &str) -> Result<Project, String> {
         let id = Uuid::new_v4().to_string();
         let created_at = now_iso();
         let color = "#4f8cff".to_string();
+        let workspace_session_id = Uuid::new_v4().to_string();
 
-        self.conn
-            .execute(
-                "INSERT INTO projects (id, name, path, color, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![id, name, path, color, created_at],
-            )
-            .map_err(|err| err.to_string())?;
+        let tx = self.conn.transaction().map_err(|err| err.to_string())?;
+        tx.execute(
+            "UPDATE projects SET sort_index = COALESCE(sort_index, 0) + 1",
+            [],
+        )
+        .map_err(|err| err.to_string())?;
 
-        self.create_workspace_session(
-            &id,
-            Some("main".to_string()),
-            WorkspaceSessionCreatedBy::User,
-            None,
-        )?;
+        tx.execute(
+            "INSERT INTO projects (id, name, path, color, sort_index, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![id, name, path, color, 0_i64, created_at],
+        )
+        .map_err(|err| err.to_string())?;
+
+        tx.execute(
+            "INSERT INTO workspace_sessions (id, project_id, name, created_by, source_session_id, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                workspace_session_id,
+                id,
+                "main",
+                workspace_session_created_by_to_str(&WorkspaceSessionCreatedBy::User),
+                Option::<String>::None,
+                created_at
+            ],
+        )
+        .map_err(|err| err.to_string())?;
+
+        tx.commit().map_err(|err| err.to_string())?;
 
         self.get_project(&id)?
             .ok_or_else(|| "Failed to reload project".to_string())
@@ -140,7 +166,7 @@ impl Database {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT id, name, path, color, icon, last_opened_at, created_at
+                "SELECT id, name, path, color, icon, sort_index, last_opened_at, created_at
                  FROM projects WHERE id = ?1",
             )
             .map_err(|err| err.to_string())?;
@@ -152,8 +178,9 @@ impl Database {
                 path: row.get(2)?,
                 color: row.get(3)?,
                 icon: row.get(4)?,
-                last_opened_at: row.get(5)?,
-                created_at: row.get(6)?,
+                sort_index: row.get(5)?,
+                last_opened_at: row.get(6)?,
+                created_at: row.get(7)?,
             })
         });
 
@@ -201,6 +228,37 @@ impl Database {
         tx.execute("DELETE FROM projects WHERE id = ?1", params![project_id])
             .map_err(|err| err.to_string())?;
         tx.commit().map_err(|err| err.to_string())
+    }
+
+    pub fn reorder_projects(&mut self, project_ids: &[String]) -> Result<Vec<Project>, String> {
+        let existing_projects = self.list_projects()?;
+        if existing_projects.len() != project_ids.len() {
+            return Err("Project reorder payload does not match existing projects".to_string());
+        }
+
+        let existing_ids = existing_projects
+            .iter()
+            .map(|project| project.id.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        let incoming_ids = project_ids
+            .iter()
+            .map(String::as_str)
+            .collect::<std::collections::HashSet<_>>();
+
+        if existing_ids != incoming_ids || incoming_ids.len() != project_ids.len() {
+            return Err("Project reorder payload is invalid".to_string());
+        }
+
+        let tx = self.conn.transaction().map_err(|err| err.to_string())?;
+        for (index, project_id) in project_ids.iter().enumerate() {
+            tx.execute(
+                "UPDATE projects SET sort_index = ?1 WHERE id = ?2",
+                params![index as i64, project_id],
+            )
+            .map_err(|err| err.to_string())?;
+        }
+        tx.commit().map_err(|err| err.to_string())?;
+        self.list_projects()
     }
 
     pub fn ensure_default_workspace_session(&self, project_id: &str) -> Result<(), String> {
@@ -376,16 +434,18 @@ impl Database {
         Ok(())
     }
 
-    pub fn list_sessions(&self, project_id: &str) -> Result<Vec<TerminalSession>, String> {
-        self.list_sessions_for_project(project_id)
-    }
+    pub fn list_session_ids_for_project(&self, project_id: &str) -> Result<Vec<String>, String> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id FROM sessions WHERE project_id = ?1 ORDER BY COALESCE(started_at, ended_at) DESC")
+            .map_err(|err| err.to_string())?;
 
-    pub fn list_sessions_for_project(&self, project_id: &str) -> Result<Vec<TerminalSession>, String> {
-        self.list_sessions_query(
-            "SELECT id, project_id, workspace_session_id, window_id, title, COALESCE(program, shell), args_json, launch_profile, tmux_shim_enabled, cwd, status, started_at, ended_at, exit_code
-             FROM sessions WHERE project_id = ?1 ORDER BY COALESCE(started_at, ended_at) DESC",
-            params![project_id],
-        )
+        let rows = stmt
+            .query_map(params![project_id], |row| row.get::<_, String>(0))
+            .map_err(|err| err.to_string())?;
+
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|err| err.to_string())
     }
 
     pub fn list_sessions_for_workspace_session(
@@ -601,5 +661,257 @@ fn parse_workspace_session_created_by(raw: String) -> WorkspaceSessionCreatedBy 
     match raw.as_str() {
         "ai" => WorkspaceSessionCreatedBy::Ai,
         _ => WorkspaceSessionCreatedBy::User,
+    }
+}
+
+fn prune_invalid_legacy_sessions(conn: &Connection) -> Result<(), String> {
+    conn.execute(
+        "DELETE FROM sessions WHERE workspace_session_id IS NULL OR window_id IS NULL",
+        [],
+    )
+    .map_err(|err| err.to_string())?;
+    Ok(())
+}
+
+fn ensure_project_sort_indexes(conn: &Connection) -> Result<(), String> {
+    let missing_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM projects WHERE sort_index IS NULL",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|err| err.to_string())?;
+
+    if missing_count == 0 {
+        return Ok(());
+    }
+
+    let mut stmt = conn
+        .prepare("SELECT id FROM projects ORDER BY created_at DESC, name ASC")
+        .map_err(|err| err.to_string())?;
+    let project_ids = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|err| err.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| err.to_string())?;
+
+    for (index, project_id) in project_ids.iter().enumerate() {
+        conn.execute(
+            "UPDATE projects SET sort_index = ?1 WHERE id = ?2",
+            params![index as i64, project_id],
+        )
+        .map_err(|err| err.to_string())?;
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Database;
+    use std::{env, fs, path::PathBuf};
+    use uuid::Uuid;
+
+    struct TestDbDir {
+        path: PathBuf,
+    }
+
+    impl TestDbDir {
+        fn new() -> Self {
+            let path = env::temp_dir().join(format!("vantara-db-test-{}", Uuid::new_v4()));
+            fs::create_dir_all(&path).expect("create temp test dir");
+            Self { path }
+        }
+    }
+
+    impl Drop for TestDbDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    #[test]
+    fn startup_prunes_legacy_sessions_with_null_workspace_fields() {
+        let temp_dir = TestDbDir::new();
+        let mut db = Database::new(temp_dir.path.clone()).expect("create db");
+        let project = db
+            .create_project("NovelWeb", "D:\\projects\\novelweb")
+            .expect("project");
+        db.ensure_default_workspace_session(&project.id)
+            .expect("default workspace session");
+
+        db.conn
+            .execute(
+                "INSERT INTO sessions (id, project_id, workspace_session_id, window_id, title, shell, program, args_json, launch_profile, tmux_shim_enabled, cwd, status, started_at, ended_at, exit_code)
+                 VALUES (?1, ?2, NULL, NULL, ?3, ?4, ?5, NULL, ?6, 0, ?7, ?8, NULL, NULL, NULL)",
+                rusqlite::params![
+                    "legacy-session-1",
+                    project.id,
+                    "Claude Unsafe",
+                    "powershell",
+                    "powershell",
+                    "claudeUnsafe",
+                    "D:\\projects\\novelweb",
+                    "failed"
+                ],
+            )
+            .expect("insert legacy session");
+
+        let invalid_count: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sessions WHERE workspace_session_id IS NULL OR window_id IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count invalid before reopen");
+        assert_eq!(invalid_count, 1);
+        drop(db);
+
+        let reopened = Database::new(temp_dir.path.clone()).expect("reopen db");
+        let invalid_count: i64 = reopened
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sessions WHERE workspace_session_id IS NULL OR window_id IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count invalid after reopen");
+        assert_eq!(invalid_count, 0);
+
+        let project_count: i64 = reopened
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM projects WHERE id = ?1",
+                [&project.id],
+                |row| row.get(0),
+            )
+            .expect("project count");
+        assert_eq!(project_count, 1);
+
+        let workspace_session_count: i64 = reopened
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM workspace_sessions WHERE project_id = ?1",
+                [&project.id],
+                |row| row.get(0),
+            )
+            .expect("workspace session count");
+        assert_eq!(workspace_session_count, 1);
+    }
+
+    #[test]
+    fn list_session_ids_for_project_tolerates_legacy_rows() {
+        let temp_dir = TestDbDir::new();
+        let mut db = Database::new(temp_dir.path.clone()).expect("create db");
+        let project = db
+            .create_project("TestAnythings", "D:\\projects\\testanythings")
+            .expect("project");
+        db.conn
+            .execute(
+                "INSERT INTO sessions (id, project_id, workspace_session_id, window_id, title, shell, program, args_json, launch_profile, tmux_shim_enabled, cwd, status, started_at, ended_at, exit_code)
+                 VALUES (?1, ?2, NULL, NULL, ?3, ?4, ?5, NULL, ?6, 0, ?7, ?8, NULL, NULL, NULL)",
+                rusqlite::params![
+                    "legacy-session-2",
+                    project.id,
+                    "AI Terminal",
+                    "powershell",
+                    "powershell",
+                    "terminal",
+                    "D:\\projects\\testanythings",
+                    "failed"
+                ],
+            )
+            .expect("insert legacy session");
+
+        let session_ids = db
+            .list_session_ids_for_project(&project.id)
+            .expect("session ids for project");
+        assert_eq!(session_ids, vec!["legacy-session-2".to_string()]);
+    }
+
+    #[test]
+    fn create_project_inserts_new_projects_at_top_of_order() {
+        let temp_dir = TestDbDir::new();
+        let mut db = Database::new(temp_dir.path.clone()).expect("create db");
+        let first = db
+            .create_project("Alpha", "D:\\projects\\alpha")
+            .expect("first project");
+        let second = db
+            .create_project("Beta", "D:\\projects\\beta")
+            .expect("second project");
+
+        let projects = db.list_projects().expect("ordered projects");
+        assert_eq!(
+            projects.iter().map(|project| project.id.as_str()).collect::<Vec<_>>(),
+            vec![second.id.as_str(), first.id.as_str()]
+        );
+        assert_eq!(projects[0].sort_index, 0);
+        assert_eq!(projects[1].sort_index, 1);
+    }
+
+    #[test]
+    fn reorder_projects_persists_manual_order() {
+        let temp_dir = TestDbDir::new();
+        let mut db = Database::new(temp_dir.path.clone()).expect("create db");
+        let alpha = db
+            .create_project("Alpha", "D:\\projects\\alpha")
+            .expect("alpha");
+        let beta = db
+            .create_project("Beta", "D:\\projects\\beta")
+            .expect("beta");
+        let gamma = db
+            .create_project("Gamma", "D:\\projects\\gamma")
+            .expect("gamma");
+
+        let reordered = db
+            .reorder_projects(&[alpha.id.clone(), gamma.id.clone(), beta.id.clone()])
+            .expect("reorder projects");
+
+        assert_eq!(
+            reordered.iter().map(|project| project.id.as_str()).collect::<Vec<_>>(),
+            vec![alpha.id.as_str(), gamma.id.as_str(), beta.id.as_str()]
+        );
+        assert_eq!(
+            reordered
+                .iter()
+                .map(|project| project.sort_index)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+    }
+
+    #[test]
+    fn startup_assigns_project_sort_indexes_using_newest_created_first() {
+        let temp_dir = TestDbDir::new();
+        let db = Database::new(temp_dir.path.clone()).expect("create db");
+
+        db.conn
+            .execute(
+                "INSERT INTO projects (id, name, path, color, sort_index, created_at) VALUES (?1, ?2, ?3, ?4, NULL, ?5)",
+                rusqlite::params!["project-old", "Older", "D:\\projects\\older", "#4f8cff", "100"],
+            )
+            .expect("insert old project");
+        db.conn
+            .execute(
+                "INSERT INTO projects (id, name, path, color, sort_index, created_at) VALUES (?1, ?2, ?3, ?4, NULL, ?5)",
+                rusqlite::params!["project-new", "Newer", "D:\\projects\\newer", "#4f8cff", "200"],
+            )
+            .expect("insert new project");
+        drop(db);
+
+        let reopened = Database::new(temp_dir.path.clone()).expect("reopen db");
+        let projects = reopened.list_projects().expect("ordered migrated projects");
+        assert_eq!(
+            projects.iter().map(|project| project.id.as_str()).collect::<Vec<_>>(),
+            vec!["project-new", "project-old"]
+        );
+        assert_eq!(
+            projects
+                .iter()
+                .map(|project| project.sort_index)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
     }
 }

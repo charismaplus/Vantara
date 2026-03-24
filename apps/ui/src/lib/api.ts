@@ -59,12 +59,14 @@ export async function listProjects() {
 
 export async function createProject(name: string, path: string) {
   if (!isTauriRuntime()) {
+    reindexMockProjects(mockState.projects, 1);
     const project: Project = {
       id: nextId("project"),
       name,
       path,
       color: "#0ea5e9",
       icon: null,
+      sortIndex: 0,
       lastOpenedAt: now(),
       createdAt: now(),
     };
@@ -93,6 +95,23 @@ export async function renameProject(projectId: string, name: string) {
   return normalizeProject(await invoke("rename_project", { projectId, name: nextName }));
 }
 
+export async function reorderProjects(projectIds: string[]) {
+  if (!isTauriRuntime()) {
+    const reordered = projectIds.map((projectId) => requireProject(projectId));
+    if (reordered.length !== mockState.projects.length) {
+      throw new Error("Project reorder payload does not match existing projects");
+    }
+    mockState.projects = reordered.map((project, index) => ({
+      ...project,
+      sortIndex: index,
+    }));
+    return [...mockState.projects];
+  }
+
+  const projects = await invoke<unknown[]>("reorder_projects", { projectIds });
+  return projects.map(normalizeProject);
+}
+
 export async function deleteProject(projectId: string) {
   if (!isTauriRuntime()) {
     const index = mockState.projects.findIndex((entry) => entry.id === projectId);
@@ -106,6 +125,7 @@ export async function deleteProject(projectId: string) {
     }
     mockState.projectSnapshots.delete(projectId);
     mockState.projects.splice(index, 1);
+    reindexMockProjects(mockState.projects);
     return { deletedProjectId: projectId, nextProjectId } satisfies DeleteProjectResult;
   }
 
@@ -492,6 +512,7 @@ function createMockState(): MockState {
     path: "D:\\FutureTeam\\00002.VantaraC",
     color: "#0ea5e9",
     icon: null,
+    sortIndex: 0,
     lastOpenedAt: now(),
     createdAt: now(),
   };
@@ -599,6 +620,12 @@ function requireProject(projectId: string) {
   return project;
 }
 
+function reindexMockProjects(projects: Project[], startIndex = 0) {
+  for (let index = 0; index < projects.length; index += 1) {
+    projects[index].sortIndex = index + startIndex;
+  }
+}
+
 function getMockProjectSnapshot(projectId: string) {
   const snapshot = mockState.projectSnapshots.get(projectId);
   if (!snapshot) {
@@ -657,6 +684,11 @@ function normalizeProject(value: unknown): Project {
     path: asString(record.path, "D:\\"),
     color: asString(record.color, "#0ea5e9"),
     icon: typeof record.icon === "string" ? record.icon : null,
+    sortIndex: typeof record.sortIndex === "number"
+      ? record.sortIndex
+      : typeof record.sort_index === "number"
+        ? record.sort_index
+        : 0,
     lastOpenedAt: normalizeNullableString(record.lastOpenedAt ?? record.last_opened_at),
     createdAt: asString(record.createdAt ?? record.created_at, now()),
   };

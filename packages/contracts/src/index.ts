@@ -4,6 +4,7 @@ export type Project = {
   path: string;
   color: string;
   icon?: string | null;
+  sortIndex: number;
   lastOpenedAt?: string | null;
   createdAt: string;
 };
