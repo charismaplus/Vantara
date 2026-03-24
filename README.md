@@ -7,6 +7,8 @@
 Vantara는 AI CLI 기반 개발을 위해 만든 프로젝트 중심 데스크톱 터미널 워크스페이스입니다.  
 일반적인 터미널처럼 탭만 늘어놓는 대신, 프로젝트와 세션, 탭, pane을 기준으로 작업 문맥을 정리하는 데 초점을 둡니다.
 
+![Vantara Screenshot](https://github.com/user-attachments/assets/3e80d6a8-1298-4bf2-9253-08c868bc8748)
+
 ## 한눈에 보기
 
 - 프로젝트별 세션 트리를 좌측 사이드바에서 관리

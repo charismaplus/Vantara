@@ -8,6 +8,8 @@ Vantara is a project-first desktop terminal workspace for AI-assisted developmen
 
 Instead of treating terminals as a flat pile of tabs, Vantara structures work around projects, sessions, tabs, and panes so that multiple codebases stay organized while using CLI tools like Claude Code and Codex.
 
+![Vantara Screenshot](https://github.com/user-attachments/assets/3e80d6a8-1298-4bf2-9253-08c868bc8748)
+
 ## Overview
 
 - Project sidebar with per-project session trees
